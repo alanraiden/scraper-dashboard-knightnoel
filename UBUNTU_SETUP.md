@@ -21,11 +21,28 @@ the intervals you configure — **no browser needs to be open**.
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip nodejs npm git
-
-# Python server deps
-pip3 install flask flask-cors requests beautifulsoup4 lxml
+sudo apt install -y python3 python3-pip python3-venv nodejs npm git curl
 ```
+
+### Python deps — pick one method:
+
+**Method A — system pip (simple):**
+```bash
+pip3 install flask flask-cors requests beautifulsoup4 lxml
+# If Ubuntu 23.04+ gives "externally-managed-environment" error, add:
+# pip3 install flask flask-cors requests beautifulsoup4 lxml --break-system-packages
+```
+
+**Method B — virtual environment (recommended / cleaner):**
+```bash
+cd /opt/knight-scraper/scraper-server
+python3 -m venv venv
+source venv/bin/activate
+pip install flask flask-cors requests beautifulsoup4 lxml
+```
+
+> ⚠️ If using venv, update `systemd/scraper.service` `ExecStart` to:
+> `/opt/knight-scraper/scraper-server/venv/bin/python3 /opt/knight-scraper/scraper-server/scraper_server.py`
 
 ---
 
@@ -74,6 +91,24 @@ npm run dev
 ```
 
 Open `http://192.168.1.3:5174` in your browser — if it loads, proceed to step 5.
+
+---
+
+## 5. Open firewall ports (required for LAN access)
+
+If you get a timeout when accessing from another device, Ubuntu's firewall is blocking the ports:
+
+```bash
+sudo ufw allow 5174/tcp   # Vite dashboard
+sudo ufw allow 7832/tcp   # Python scraper API
+sudo ufw status           # verify
+```
+
+If `ufw` shows **Status: inactive**, your firewall is off and ports are already open.
+Check if the ports are actually listening:
+```bash
+ss -tlnp | grep -E '5174|7832'
+```
 
 ---
 
