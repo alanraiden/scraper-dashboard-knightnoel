@@ -1,9 +1,8 @@
 """
 scraper_server.py — Local Scraper API Server (v3 — adapter architecture)
 =========================================================================
-Runs on http://localhost:7832
-The React dashboard connects to this to run scraping jobs server-side,
-avoiding all CORS proxy limitations and JS-rendering issues.
+Runs on http://0.0.0.0:7832  (LAN-accessible)
+The React dashboard connects to this to run scraping jobs server-side.
 
 Start it with:
     python scraper_server.py
@@ -47,6 +46,25 @@ PORT = 7832
 # -- Active jobs store --------------------------------------------------------
 jobs      = {}
 jobs_lock = threading.Lock()
+
+# -- Watches store (server-side 24/7 watcher) ----------------------------------
+_WATCHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watches.json")
+_watches_lock = threading.Lock()
+
+def _load_watches():
+    """Load watches from disk. Returns dict keyed by novelId."""
+    try:
+        if os.path.exists(_WATCHES_FILE):
+            with open(_WATCHES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_watches(watches):
+    """Persist watches to disk."""
+    with open(_WATCHES_FILE, "w", encoding="utf-8") as f:
+        json.dump(watches, f, indent=2, ensure_ascii=False)
 
 # -- Scraper config -----------------------------------------------------------
 DEFAULT_DELAY      = 1.2
@@ -836,16 +854,275 @@ def test_adapter():
         return jsonify({"error": str(e)}), 500
 
 
+# =============================================================================
+#  WATCH SCHEDULER — runs 24/7, fires scrape jobs for active watches
+# =============================================================================
+
+class WatchScheduler:
+    """
+    Background thread that wakes every 60 seconds and triggers a scrape job
+    for any watch whose interval has elapsed.  Completely independent of the
+    browser / React dashboard.
+    """
+
+    def __init__(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            time.sleep(60)
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[Scheduler] Unhandled error: {e}")
+
+    def _tick(self):
+        now = time.time()
+        with _watches_lock:
+            watches = _load_watches()
+
+        for novel_id, w in watches.items():
+            if not w.get("active"):
+                continue
+            interval_secs = float(w.get("intervalHours", 1)) * 3600
+            last_checked  = w.get("lastChecked", 0)
+            # Skip if a job for this novel is already running
+            already_running = any(
+                j.get("novel_id") == novel_id and j.get("status") in ("pending", "running")
+                for j in jobs.values()
+            )
+            if already_running:
+                continue
+            if now - last_checked >= interval_secs:
+                print(f"[Scheduler] Triggering watch for: {w.get('novelTitle', novel_id)}")
+                self._trigger(novel_id, w)
+
+    def _trigger(self, novel_id, w):
+        mode = w.get("mode", "chain")
+        # Chain mode: crawl from last known chapter URL
+        if mode == "chain":
+            crawl_start = w.get("lastChapterUrl") or w.get("chapterOneUrl") or w.get("startUrl", "")
+        else:
+            crawl_start = w.get("chapterOneUrl") or w.get("startUrl", "")
+
+        params = {
+            "mode":             "watch_check",
+            "start_url":        w.get("startUrl", "") if mode != "chain" else crawl_start,
+            "chapter_one_url":  crawl_start,
+            "novel_id":         novel_id,
+            "novel_slug":       w.get("novelSlug", ""),
+            "api_url":          w.get("apiUrl", ""),
+            "token":            w.get("token", ""),
+            "from_chapter":     w.get("lastChapter", 0),
+            "index_offset":     w.get("lastChapter", 0) if mode == "chain" else 0,
+            "delay":            w.get("delay", DEFAULT_DELAY),
+            "max_chapters":     500,
+            "watch_mode":       mode,
+            "check_selector":   w.get("checkSelector", ""),
+        }
+
+        job_id = str(uuid.uuid4())[:8]
+        with jobs_lock:
+            jobs[job_id] = {"status": "pending", "logs": [], "stats": {}, "novel_id": novel_id}
+        t = threading.Thread(
+            target=self._run_and_update,
+            args=(job_id, params, novel_id),
+            daemon=True,
+        )
+        t.start()
+
+    def _run_and_update(self, job_id, params, novel_id):
+        """Run the scrape job then write lastChecked/lastChapter back to watches.json."""
+        run_scrape_job(job_id, params)
+
+        # Read back the job stats to find the highest chapter uploaded
+        with jobs_lock:
+            job   = jobs.get(job_id, {})
+            stats = job.get("stats", {})
+            logs  = job.get("logs", [])
+
+        new_last = stats.get("last_chapter", 0)
+
+        with _watches_lock:
+            watches = _load_watches()
+            if novel_id in watches:
+                w = watches[novel_id]
+                w["lastChecked"] = time.time()
+                if new_last and new_last > w.get("lastChapter", 0):
+                    w["lastChapter"] = new_last
+                # Chain: update lastChapterUrl so next run starts where we left off
+                if w.get("mode") == "chain":
+                    for log in reversed(logs):
+                        if "__last_chapter_url__:" in log.get("msg", ""):
+                            w["lastChapterUrl"] = log["msg"].split("__last_chapter_url__:")[1].strip()
+                            break
+                _save_watches(watches)
+
+
+# =============================================================================
+#  WATCHES REST API
+# =============================================================================
+
+@app.route("/watches", methods=["GET"])
+def list_watches():
+    """List all watches with their current status."""
+    with _watches_lock:
+        watches = _load_watches()
+    # Annotate each watch with whether a job is currently running for it
+    result = []
+    for novel_id, w in watches.items():
+        running_job = next(
+            (j for j in jobs.values()
+             if j.get("novel_id") == novel_id and j.get("status") in ("pending", "running")),
+            None,
+        )
+        result.append({
+            **w,
+            "novelId":   novel_id,
+            "isRunning": running_job is not None,
+        })
+    return jsonify({"watches": result, "count": len(result)})
+
+
+@app.route("/watches", methods=["POST"])
+def upsert_watch():
+    """
+    Add or update a watch.
+    Body: { novelId, novelSlug, novelTitle, startUrl, chapterOneUrl,
+            mode, intervalHours, apiUrl, token, checkSelector?,
+            lastChapter?, lastChecked?, active? }
+    """
+    body     = request.json or {}
+    novel_id = body.get("novelId", "").strip()
+    if not novel_id:
+        return jsonify({"error": "novelId is required"}), 400
+    if not body.get("novelSlug", "").strip():
+        return jsonify({"error": "novelSlug is required"}), 400
+    if not body.get("startUrl", "").strip():
+        return jsonify({"error": "startUrl is required"}), 400
+
+    with _watches_lock:
+        watches = _load_watches()
+        existing = watches.get(novel_id, {})
+        watches[novel_id] = {
+            # Preserve runtime fields if they exist
+            "lastChapter":    existing.get("lastChapter",    body.get("lastChapter",    0)),
+            "lastChecked":    existing.get("lastChecked",    body.get("lastChecked",    0)),
+            "lastChapterUrl": existing.get("lastChapterUrl", body.get("lastChapterUrl", "")),
+            # Config from request
+            "novelSlug":      body.get("novelSlug", "").strip(),
+            "novelTitle":     body.get("novelTitle", "").strip(),
+            "startUrl":       body.get("startUrl", "").strip(),
+            "chapterOneUrl":  body.get("chapterOneUrl", body.get("startUrl", "")).strip(),
+            "mode":           body.get("mode", "chain"),
+            "intervalHours":  float(body.get("intervalHours", 6)),
+            "checkSelector":  body.get("checkSelector", ""),
+            "active":         bool(body.get("active", existing.get("active", False))),
+            "apiUrl":         body.get("apiUrl", existing.get("apiUrl", "")),
+            "token":          body.get("token",  existing.get("token",  "")),
+            "delay":          float(body.get("delay", existing.get("delay", DEFAULT_DELAY))),
+        }
+        _save_watches(watches)
+    return jsonify({"ok": True, "novelId": novel_id})
+
+
+@app.route("/watches/<novel_id>", methods=["DELETE"])
+def delete_watch(novel_id):
+    """Remove a watch."""
+    with _watches_lock:
+        watches = _load_watches()
+        removed = novel_id in watches
+        watches.pop(novel_id, None)
+        _save_watches(watches)
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/watches/<novel_id>/start", methods=["POST"])
+def start_watch(novel_id):
+    """Enable auto-scheduling for a watch."""
+    with _watches_lock:
+        watches = _load_watches()
+        if novel_id not in watches:
+            return jsonify({"error": "Watch not found"}), 404
+        watches[novel_id]["active"] = True
+        _save_watches(watches)
+    return jsonify({"ok": True})
+
+
+@app.route("/watches/<novel_id>/stop", methods=["POST"])
+def stop_watch(novel_id):
+    """Disable auto-scheduling for a watch."""
+    with _watches_lock:
+        watches = _load_watches()
+        if novel_id not in watches:
+            return jsonify({"error": "Watch not found"}), 404
+        watches[novel_id]["active"] = False
+        _save_watches(watches)
+    return jsonify({"ok": True})
+
+
+@app.route("/watches/<novel_id>/run", methods=["POST"])
+def run_watch_now(novel_id):
+    """Trigger an immediate watch check for a novel (regardless of interval)."""
+    with _watches_lock:
+        watches = _load_watches()
+    if novel_id not in watches:
+        return jsonify({"error": "Watch not found"}), 404
+
+    # Refuse if already running
+    already = any(
+        j.get("novel_id") == novel_id and j.get("status") in ("pending", "running")
+        for j in jobs.values()
+    )
+    if already:
+        return jsonify({"error": "A check is already running for this novel"}), 409
+
+    scheduler._trigger(novel_id, watches[novel_id])
+
+    # Find the newly created job_id
+    job_id = next(
+        (jid for jid, j in jobs.items() if j.get("novel_id") == novel_id and j.get("status") == "pending"),
+        None,
+    )
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/watches/<novel_id>", methods=["PATCH"])
+def patch_watch(novel_id):
+    """Update runtime fields: lastChapter, lastChecked, lastChapterUrl."""
+    body = request.json or {}
+    with _watches_lock:
+        watches = _load_watches()
+        if novel_id not in watches:
+            return jsonify({"error": "Watch not found"}), 404
+        w = watches[novel_id]
+        if "lastChapter"    in body: w["lastChapter"]    = body["lastChapter"]
+        if "lastChecked"    in body: w["lastChecked"]    = body["lastChecked"]
+        if "lastChapterUrl" in body: w["lastChapterUrl"] = body["lastChapterUrl"]
+        if "active"         in body: w["active"]         = bool(body["active"])
+        _save_watches(watches)
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+#  ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
-    adapter_count = len(registry)
+    adapter_count  = len(registry)
+    scheduler      = WatchScheduler()
+    active_watches = len([w for w in _load_watches().values() if w.get("active")])
     print(f"""
 +--------------------------------------------------+
-|      NovaSphere Local Scraper Server v3          |
-|      Running on http://localhost:{PORT}           |
+|   Knight Novel Scraper Server v4 (LAN mode)      |
+|   Running on http://0.0.0.0:{PORT}               |
 |                                                  |
-|  {adapter_count} adapters loaded                            |
-|  Keep this terminal open while using the         |
-|  React dashboard.  Press Ctrl+C to stop.         |
+|   {adapter_count} adapters loaded                           |
+|   {active_watches} watch(es) active (scheduler running)     |
+|                                                  |
+|   Access from LAN: http://<your-ip>:{PORT}       |
+|   Press Ctrl+C to stop.                          |
 +--------------------------------------------------+
 """)
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

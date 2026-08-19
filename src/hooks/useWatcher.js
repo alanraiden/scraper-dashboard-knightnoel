@@ -4,8 +4,12 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { checkForNewChapters }          from '../lib/scraper.js'
-import { createChapter, getNovelChapters, getNovels } from '../lib/api.js'
-import { checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter } from '../lib/localScraper.js'
+import { createChapter, getNovelChapters, getNovels, getCredentials } from '../lib/api.js'
+import {
+  checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter,
+  getServerWatches, upsertServerWatch, deleteServerWatch,
+  startServerWatch, stopServerWatch, runServerWatchNow, patchServerWatch,
+} from '../lib/localScraper.js'
 import { saveJobToHistory } from '../components/JobHistory.jsx'
 import { loadWatermarks }   from '../components/WatermarkEditor.jsx'
 
@@ -19,6 +23,25 @@ function loadWatched() {
 function saveWatched(list) { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)) }
 function hasContent(ch)    { return (ch.content || '').trim().length >= 50 }
 
+// Build the payload the Python server needs to run a watch autonomously
+function watchToServer(w) {
+  return {
+    novelId:       w.novelId,
+    novelSlug:     w.novelSlug     || '',
+    novelTitle:    w.novelTitle    || '',
+    startUrl:      w.startUrl      || '',
+    chapterOneUrl: w.chapterOneUrl || w.startUrl || '',
+    mode:          w.mode          || 'chain',
+    intervalHours: w.intervalHours || 6,
+    checkSelector: w.checkSelector || '',
+    lastChapter:   w.lastChapter   || 0,
+    lastChecked:   w.lastChecked   || 0,
+    lastChapterUrl:w.lastChapterUrl|| '',
+    active:        !!w.enabled,
+    delay:         w.delay         || 1.2,
+  }
+}
+
 export function useWatcher(addLog) {
   const [watched,     setWatched]     = useState(loadWatched)
   const [running,     setRunning]     = useState({})
@@ -28,11 +51,26 @@ export function useWatcher(addLog) {
 
   useEffect(() => { saveWatched(watched) }, [watched])
 
-  // ── Poll server health every 10 seconds ───────────────────────────────────
+  // ── Poll server health + sync watches every 10 seconds ───────────────────
   useEffect(() => {
     async function check() {
       const info = await fetchHealthInfo()
-      setServerOnline(!!info)
+      const online = !!info
+      setServerOnline(prev => {
+        // On first connect: push all local watches to the server
+        if (!prev && online) {
+          const local = loadWatched()
+          const { apiUrl, scraperKey } = getCredentials()
+          local.forEach(w => {
+            upsertServerWatch({
+              ...watchToServer(w),
+              apiUrl,
+              token: scraperKey,
+            }).catch(() => {})
+          })
+        }
+        return online
+      })
     }
     check()
     healthRef.current = setInterval(check, 10000)
@@ -40,31 +78,35 @@ export function useWatcher(addLog) {
   }, [])
 
   const addWatch = useCallback((entry) => {
+    const { apiUrl, scraperKey } = getCredentials()
     setWatched(prev => {
       const existing = prev.find(w => w.novelId === entry.novelId)
-      if (existing) {
-        // Update existing entry — preserve lastChapter and lastChecked
-        return prev.map(w =>
-          w.novelId === entry.novelId
-            ? { ...w, ...entry, lastChapter: w.lastChapter, lastChecked: w.lastChecked }
-            : w
-        )
+      const merged = existing
+        ? prev.map(w =>
+            w.novelId === entry.novelId
+              ? { ...w, ...entry, lastChapter: w.lastChapter, lastChecked: w.lastChecked }
+              : w
+          )
+        : [...prev, {
+            ...entry,
+            lastChapter:   0,
+            lastChecked:   null,
+            enabled:       false,
+            chapterOneUrl: entry.chapterOneUrl || entry.startUrl,
+          }]
+      // Mirror to Python server (fire and forget)
+      const saved = merged.find(w => w.novelId === entry.novelId)
+      if (saved) {
+        upsertServerWatch({ ...watchToServer(saved), apiUrl, token: scraperKey }).catch(() => {})
       }
-      return [...prev, {
-        ...entry,
-        lastChapter: 0,
-        lastChecked: null,
-        enabled: true,
-        // chapterOneUrl stores the chapter-1 URL for forward-crawl scraping.
-        // startUrl is used as-is for the watch check (index page or latest chapter URL).
-        chapterOneUrl: entry.chapterOneUrl || entry.startUrl,
-      }]
+      return merged
     })
   }, [])
 
   const removeWatch = useCallback((novelId) => {
     stopWatch(novelId)
     setWatched(prev => prev.filter(w => w.novelId !== novelId))
+    deleteServerWatch(novelId).catch(() => {})
   }, [])
 
   const updateWatch = useCallback((novelId, patch) => {
@@ -324,13 +366,16 @@ export function useWatcher(addLog) {
     const id = setInterval(() => runCheck(novelId), intervalHours * 60 * 60 * 1000)
     timersRef.current[novelId] = id
     updateWatch(novelId, { enabled: true })
-    addLog(novelId, `Auto-watcher started (every ${intervalHours}h)`, 'info')
+    // Mirror to server — server scheduler will also fire independently
+    startServerWatch(novelId).catch(() => {})
+    addLog(novelId, `Auto-watcher started (every ${intervalHours}h) — server scheduler active`, 'info')
   }, [runCheck, updateWatch, addLog])
 
   const stopWatch = useCallback((novelId) => {
     const id = timersRef.current[novelId]
     if (id) { clearInterval(id); delete timersRef.current[novelId] }
     updateWatch(novelId, { enabled: false })
+    stopServerWatch(novelId).catch(() => {})
     addLog(novelId, `Auto-watcher stopped`, 'warn')
   }, [updateWatch, addLog])
 

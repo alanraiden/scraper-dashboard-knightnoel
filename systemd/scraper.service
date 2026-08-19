@@ -1,0 +1,19 @@
+[Unit]
+Description=Knight Novel Scraper Server (24/7 watcher)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/knight-scraper/scraper-server
+ExecStart=/usr/bin/python3 /opt/knight-scraper/scraper-server/scraper_server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Prevent the service from eating too much memory
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

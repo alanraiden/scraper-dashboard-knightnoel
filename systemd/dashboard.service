@@ -1,0 +1,17 @@
+[Unit]
+Description=Knight Novel Scraper Dashboard (Vite)
+After=network.target scraper.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/knight-scraper
+ExecStart=/usr/bin/npm run dev
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=NODE_ENV=development
+
+[Install]
+WantedBy=multi-user.target

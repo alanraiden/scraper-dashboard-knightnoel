@@ -101,3 +101,70 @@ export async function detectLatestChapter(url, checkSelector = '') {
   if (!res.ok) throw new Error(`Detection failed: ${res.status}`)
   return res.json()  // { latest_num, chapter_url }
 }
+
+// =============================================================================
+//  WATCHES API  — server-side 24/7 watcher
+// =============================================================================
+
+// GET /watches — returns { watches: [...], count }
+export async function getServerWatches() {
+  const res = await fetch(`${SERVER}/watches`)
+  if (!res.ok) throw new Error(`Failed to fetch watches: ${res.status}`)
+  return res.json()
+}
+
+// POST /watches — upsert a watch on the server (includes apiUrl + token)
+export async function upsertServerWatch(watch) {
+  const res = await fetch(`${SERVER}/watches`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(watch),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || `Server error ${res.status}`)
+  }
+  return res.json()
+}
+
+// DELETE /watches/<novelId>
+export async function deleteServerWatch(novelId) {
+  const res = await fetch(`${SERVER}/watches/${novelId}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Failed to delete watch: ${res.status}`)
+  return res.json()
+}
+
+// POST /watches/<novelId>/start — enable scheduler for this watch
+export async function startServerWatch(novelId) {
+  const res = await fetch(`${SERVER}/watches/${novelId}/start`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to start watch: ${res.status}`)
+  return res.json()
+}
+
+// POST /watches/<novelId>/stop — disable scheduler for this watch
+export async function stopServerWatch(novelId) {
+  const res = await fetch(`${SERVER}/watches/${novelId}/stop`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to stop watch: ${res.status}`)
+  return res.json()
+}
+
+// POST /watches/<novelId>/run — trigger an immediate check (returns { job_id })
+export async function runServerWatchNow(novelId) {
+  const res = await fetch(`${SERVER}/watches/${novelId}/run`, { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || `Server error ${res.status}`)
+  }
+  return res.json()
+}
+
+// PATCH /watches/<novelId> — update runtime fields (lastChapter, lastChecked, etc.)
+export async function patchServerWatch(novelId, fields) {
+  const res = await fetch(`${SERVER}/watches/${novelId}`, {
+    method:  'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(fields),
+  })
+  if (!res.ok) throw new Error(`Failed to patch watch: ${res.status}`)
+  return res.json()
+}
