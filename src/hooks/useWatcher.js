@@ -4,7 +4,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { checkForNewChapters }          from '../lib/scraper.js'
-import { createChapter, getNovelChapters } from '../lib/api.js'
+import { createChapter, getNovelChapters, getNovels } from '../lib/api.js'
 import { checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter } from '../lib/localScraper.js'
 import { saveJobToHistory } from '../components/JobHistory.jsx'
 import { loadWatermarks }   from '../components/WatermarkEditor.jsx'
@@ -19,7 +19,7 @@ function loadWatched() {
 function saveWatched(list) { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)) }
 function hasContent(ch)    { return (ch.content || '').trim().length >= 50 }
 
-export function useWatcher(addLog, novels = []) {
+export function useWatcher(addLog) {
   const [watched,     setWatched]     = useState(loadWatched)
   const [running,     setRunning]     = useState({})
   const [serverOnline,setServerOnline]= useState(false)
@@ -85,20 +85,26 @@ export function useWatcher(addLog, novels = []) {
     if (!entry) { setRunning(prev => ({ ...prev, [novelId]: false })); return }
 
     // Get authoritative chapter list from the API and find the lowest gap
-    // entry.novelSlug is the KN novel slug; backfill from the loaded novels list
-    // if it was missing from the saved entry (legacy entries pre-novelSlug field).
+    // entry.novelSlug is the KN novel slug.
+    // If it's missing (legacy entry saved before novelSlug was stored), fetch
+    // it directly from the KN novels API and backfill it in localStorage.
     let storedLast = entry.lastChapter || 0
     let novelSlug = entry.novelSlug || ''
     if (!novelSlug) {
-      // Try to find the slug from the currently loaded novels list
-      const match = novels.find(n => n._id === novelId)
-      if (match?.slug) {
-        novelSlug = match.slug
-        // Backfill so future checks don't need this lookup
-        setWatched(prev => prev.map(w =>
-          w.novelId === novelId ? { ...w, novelSlug } : w
-        ))
-        addLog(novelId, `Backfilled novelSlug: '${novelSlug}'`, 'dim')
+      try {
+        const data = await getNovels()
+        const match = (data.novels || []).find(n => n._id === novelId)
+        if (match?.slug) {
+          novelSlug = match.slug
+          setWatched(prev => prev.map(w =>
+            w.novelId === novelId ? { ...w, novelSlug } : w
+          ))
+          addLog(novelId, `Backfilled novelSlug: '${novelSlug}'`, 'dim')
+        } else {
+          addLog(novelId, `Could not resolve slug for novel ${novelId} — upload will fail`, 'err')
+        }
+      } catch (e) {
+        addLog(novelId, `Could not fetch novels to resolve slug: ${e.message}`, 'warn')
       }
     }
     try {

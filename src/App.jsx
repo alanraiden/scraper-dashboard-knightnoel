@@ -47,7 +47,7 @@ export default function App() {
   }, [])
 
   // ── Watcher hook ──────────────────────────────────────────────────────────
-  const { watched, addWatch, removeWatch, updateWatch, runCheck, startWatch, stopWatch, running, isWatching, resetChapter, updateChainUrl, serverOnline } = useWatcher(addLog, novels)
+  const { watched, addWatch, removeWatch, updateWatch, runCheck, startWatch, stopWatch, running, isWatching, resetChapter, updateChainUrl, serverOnline } = useWatcher(addLog)
 
   // ── Auto-login if creds saved ─────────────────────────────────────────────
   useEffect(() => {
