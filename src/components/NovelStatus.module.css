@@ -1,0 +1,39 @@
+.wrap { position: relative; display: inline-flex; }
+
+.badge {
+  display: inline-flex; align-items: center;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 20px;
+  border: 1px solid var(--border); color: var(--muted); background: transparent;
+  cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  font-family: var(--mono);
+}
+.badge:hover { border-color: var(--border2); color: var(--text); }
+
+.picker {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 200;
+  background: var(--surface2); border: 1px solid var(--border2);
+  border-radius: 8px; padding: 5px; min-width: 130px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  display: flex; flex-direction: column; gap: 2px;
+}
+
+.pickerBtn {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 10px; border-radius: 5px; border: none;
+  background: transparent; color: var(--muted); font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s; text-align: left;
+}
+.pickerBtn:hover { background: var(--surface3); color: var(--text); }
+.pickerBtnActive { background: var(--sb, rgba(74,222,128,0.1)); color: var(--sc, #4ade80) !important; }
+
+.pickerDot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.pickerCheck { margin-left: auto; font-size: 11px; }
+
+.pickerClear {
+  margin-top: 3px; padding: 5px 10px; border-radius: 5px;
+  border-top: 1px solid var(--border); border-left: none; border-right: none; border-bottom: none;
+  background: transparent; color: var(--muted); font-size: 11px;
+  cursor: pointer; transition: color 0.12s; text-align: left;
+}
+.pickerClear:hover { color: var(--accent3); }

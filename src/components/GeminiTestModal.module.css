@@ -1,0 +1,56 @@
+.wide { width: 720px; }
+
+.textarea {
+  width: 100%; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); font-size: 12px;
+  font-family: var(--mono); padding: 12px 14px; outline: none;
+  transition: border-color 0.15s; resize: vertical; line-height: 1.7;
+  box-sizing: border-box;
+}
+.textarea:focus { border-color: var(--accent); }
+.textarea::placeholder { color: var(--muted2); }
+.textarea:disabled { opacity: 0.6; }
+
+.actions {
+  display: flex; align-items: center; justify-content: space-between;
+}
+.hint { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
+/* Score bar */
+.scoreBar {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 14px;
+}
+.scoreLeft { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.scoreLabel { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
+.scoreNum { font-family: var(--mono); font-size: 18px; font-weight: 700; }
+.scoreMeter {
+  flex: 1; height: 6px; background: var(--border);
+  border-radius: 3px; overflow: hidden;
+}
+.scoreFill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+.scoreTag { font-size: 11px; font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+
+/* Tabs */
+.tabs {
+  display: flex; gap: 4px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.tab {
+  display: flex; align-items: center; gap: 6px;
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); font-size: 12px; font-weight: 600;
+  padding: 6px 12px; cursor: pointer; margin-bottom: -1px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.tab:hover { color: var(--text); }
+.tabActive { color: var(--accent) !important; border-bottom-color: var(--accent) !important; }
+
+.tabBadge {
+  background: rgba(251,191,36,0.15); border: 1px solid rgba(251,191,36,0.3);
+  color: var(--warning); font-size: 10px; font-weight: 700;
+  border-radius: 3px; padding: 0px 5px;
+}
+
+.preview { max-height: 320px; }
