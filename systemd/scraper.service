@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=iden
-WorkingDirectory=/opt/knight-scraper/scraper-server
-ExecStart=/usr/bin/python3 /opt/knight-scraper/scraper-server/scraper_server.py
+WorkingDirectory=/home/iden/scraper-dashboard-knightnoel/scraper-server
+ExecStart=/usr/bin/python3 /home/iden/scraper-dashboard-knightnoel/scraper-server/scraper_server.py
 Restart=always
 RestartSec=10
 StandardOutput=journal

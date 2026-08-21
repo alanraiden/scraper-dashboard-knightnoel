@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-REPO_DIR="/opt/knight-scraper"
+REPO_DIR="/home/iden/scraper-dashboard-knightnoel"
 LOG_TAG="knight-autoupdate"
 
 log() { logger -t "$LOG_TAG" "$*"; echo "$*"; }
@@ -46,6 +46,8 @@ if git diff --name-only "$LOCAL" "$REMOTE" | grep -q "systemd/"; then
     log "Service files changed — reloading systemd..."
     cp "$REPO_DIR/systemd/scraper.service"   /etc/systemd/system/
     cp "$REPO_DIR/systemd/dashboard.service" /etc/systemd/system/
+    cp "$REPO_DIR/systemd/knight-update.service" /etc/systemd/system/
+    cp "$REPO_DIR/systemd/knight-update.timer"   /etc/systemd/system/
     systemctl daemon-reload
 fi
 

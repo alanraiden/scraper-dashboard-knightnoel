@@ -6,6 +6,6 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=root
-ExecStart=/opt/knight-scraper/systemd/update.sh
+ExecStart=/home/iden/scraper-dashboard-knightnoel/systemd/update.sh
 StandardOutput=journal
 StandardError=journal
