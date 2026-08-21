@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # =============================================================================
 #  setup.sh â€” Knight Novel Scraper + Dashboard â€” Full Server Bootstrap
 #
@@ -80,8 +80,10 @@ fi
 # ===========================================================================
 step "[1/8] Installing system dependencies..."
 apt-get update -qq
-apt-get install -y python3 python3-pip python3-venv nodejs npm git curl ufw
-ok "System packages installed: python3, nodejs, npm, git, curl, ufw"
+# NOTE: nodejs from NodeSource already bundles npm — do NOT install the ubuntu apt npm
+# package alongside it, they conflict. npm comes with nodejs automatically.
+apt-get install -y python3 python3-pip python3-venv nodejs git curl ufw
+ok "System packages installed: python3, nodejs (+ bundled npm), git, curl, ufw"
 
 # ===========================================================================
 # [2/8] Clone (or refresh) the repository
