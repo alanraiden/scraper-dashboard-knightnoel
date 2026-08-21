@@ -4,7 +4,7 @@ After=network.target scraper.service
 
 [Service]
 Type=simple
-User=ubuntu
+User=iden
 WorkingDirectory=/opt/knight-scraper
 ExecStart=/usr/bin/npm run dev
 Restart=always

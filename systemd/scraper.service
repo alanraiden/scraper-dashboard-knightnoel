@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=iden
 WorkingDirectory=/opt/knight-scraper/scraper-server
 ExecStart=/usr/bin/python3 /opt/knight-scraper/scraper-server/scraper_server.py
 Restart=always
