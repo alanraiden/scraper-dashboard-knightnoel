@@ -1,0 +1,11 @@
+[Unit]
+Description=Knight Novel — Auto-update from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/knight-scraper/systemd/update.sh
+StandardOutput=journal
+StandardError=journal

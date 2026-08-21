@@ -58,7 +58,7 @@ scp -r "C:\Users\ALAN\Downloads\scraper-dashboard-knightnovel" ubuntu@192.168.1.
 ```bash
 # On the Ubuntu server
 sudo mkdir -p /opt/knight-scraper
-sudo chown ubuntu:ubuntu /opt/knight-scraper
+sudo chown iden:iden /opt/knight-scraper
 cd /opt
 git clone <your-repo-url> knight-scraper
 ```
@@ -181,17 +181,83 @@ sudo journalctl -u scraper -n 50
 
 ---
 
-## 10. Updating the code
+## 10. Auto-update from GitHub (recommended)
+
+The project includes a systemd timer that polls GitHub every 5 minutes and automatically pulls
+new code + restarts services whenever you push a commit.
+
+### One-time setup on the server
 
 ```bash
-# If you used Git
-cd /opt/knight-scraper
-git pull
-npm install                    # if package.json changed
-sudo systemctl restart scraper dashboard
+# 1. Make the update script executable
+chmod +x /opt/knight-scraper/systemd/update.sh
+
+# 2. Install the update service + timer
+sudo cp /opt/knight-scraper/systemd/knight-update.service /etc/systemd/system/
+sudo cp /opt/knight-scraper/systemd/knight-update.timer   /etc/systemd/system/
+
+# 3. Enable and start the timer (NOT the .service — the timer drives it)
+sudo systemctl daemon-reload
+sudo systemctl enable --now knight-update.timer
+
+# 4. Verify the timer is scheduled
+sudo systemctl list-timers knight-update.timer
 ```
 
-If you used SCP, re-copy the changed files and restart the services.
+### How it works
+
+```
+You push to GitHub
+        ↓  (within 5 minutes)
+knight-update.timer fires
+        ↓
+knight-update.service runs update.sh
+        ↓
+git fetch → compare LOCAL vs REMOTE HEAD
+        ↓ (only if different)
+git pull + npm install (if package.json changed)
+        ↓
+systemctl restart scraper dashboard
+```
+
+### Triggering an update immediately
+
+```bash
+# Force an instant pull right now (don't wait for the timer)
+sudo systemctl start knight-update.service
+
+# Watch the update log live
+sudo journalctl -u knight-update -f
+```
+
+### Check auto-update logs
+
+```bash
+# See all recent auto-update runs
+sudo journalctl -u knight-update --since "1 hour ago"
+
+# See when the timer last ran and when it fires next
+sudo systemctl list-timers knight-update.timer
+```
+
+### Disable auto-update (if needed)
+
+```bash
+sudo systemctl disable --now knight-update.timer
+```
+
+---
+
+## 11. Updating the code manually
+
+If you prefer to update manually instead of using the auto-updater:
+
+```bash
+cd /opt/knight-scraper
+git pull
+npm install                    # only if package.json changed
+sudo systemctl restart scraper dashboard
+```
 
 ---
 
@@ -204,3 +270,4 @@ If you used SCP, re-copy the changed files and restart the services.
 | "Module not found" errors | Re-run `pip3 install flask flask-cors requests beautifulsoup4 lxml` |
 | Watches not auto-running | Check `watches.json` has `"active": true` and `intervalHours` is set |
 | Can't reach Vercel API | Your server needs internet access — check with `curl https://google.com` |
+| Auto-update not pulling | Check: `journalctl -u knight-update -n 20` and ensure git remote is set correctly |

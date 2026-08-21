@@ -1,0 +1,10 @@
+[Unit]
+Description=Knight Novel — Auto-update timer (every 5 minutes)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=knight-update.service
+
+[Install]
+WantedBy=timers.target
