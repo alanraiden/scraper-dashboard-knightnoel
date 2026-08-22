@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # =============================================================================
 #  /home/iden/scraper-dashboard-knightnoel/systemd/update.sh
 #  Auto-update script â€” called by knight-update.timer every 5 minutes.
@@ -23,6 +23,11 @@ die() { log "FATAL: $*"; exit 1; }
 [[ -d "$REPO_DIR/.git" ]] || die "Repo not found at $REPO_DIR. Run setup-autoUpdate.sh first."
 
 cd "$REPO_DIR" || die "Cannot cd into $REPO_DIR"
+
+# Git 2.36+ blocks operations on repos owned by a different user (security check).
+# This service runs as root but the repo is owned by the service user — add an
+# explicit exception so git fetch/pull work correctly.
+git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
 
 # Make sure we are tracking the right remote
 CURRENT_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
