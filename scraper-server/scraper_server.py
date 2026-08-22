@@ -395,6 +395,28 @@ def upload_chapter(novel_slug, chapter, api_url, token, log_fn=None):
         return False, str(e)
 
 
+def _fetch_max_stored_chapter(api_url, novel_slug, token):
+    """Query the KN API for all stored chapters and return the highest chapter number.
+    Returns 0 if none are stored, or if the request fails (fail-safe — crawl from start)."""
+    if not api_url or not novel_slug:
+        return 0
+    try:
+        url = f"{api_url.rstrip('/')}/api/scraper/novels/{novel_slug}/chapters"
+        headers = {"x-scraper-key": token} if token else {}
+        r = requests.get(url, headers=headers, timeout=15)
+        if not r.ok:
+            return 0
+        data = r.json()
+        # The endpoint may return a list directly or {chapters: [...]}
+        chapters = data if isinstance(data, list) else data.get("chapters", [])
+        if not chapters:
+            return 0
+        numbers = [int(c.get("number", 0)) for c in chapters if c.get("number")]
+        return max(numbers) if numbers else 0
+    except Exception:
+        return 0
+
+
 def bulk_upload_chapters(novel_slug, chapters, api_url, token, log_fn=None):
     """Upload multiple chapters via the KN scraper API bridge.
     POST /api/scraper/novels/:slug/chapters  (existing compiled route)
@@ -538,6 +560,14 @@ def run_scrape_job(job_id, params):
             return t.strip() or title
 
         if mode == "watch_check":
+            # Query the KN backend for the real highest stored chapter so we never
+            # re-crawl from Ch.1. Overrides whatever from_chapter was passed in.
+            # Gaps (deleted chapters) are handled by the separate gap-detection feature.
+            api_max = _fetch_max_stored_chapter(api_url, novel_slug, token)
+            if api_max > from_chapter:
+                log(f"KN API reports {api_max} chapters stored — starting after Ch.{api_max}", "dim")
+                from_chapter  = api_max
+                index_offset  = api_max   # chain mode: keep index numbering aligned
             log(f"-- Watch check started (stored up to Ch.{from_chapter}) --", "info")
 
         log(f"Starting forward crawl from: {chapter_one_url}", "info")
