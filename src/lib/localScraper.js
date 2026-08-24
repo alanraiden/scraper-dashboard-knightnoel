@@ -168,3 +168,21 @@ export async function patchServerWatch(novelId, fields) {
   if (!res.ok) throw new Error(`Failed to patch watch: ${res.status}`)
   return res.json()
 }
+
+// PATCH /config — set concurrency limit on the Python server
+export async function patchServerConfig(fields) {
+  const res = await fetch(`${SERVER}/config`, {
+    method:  'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(fields),
+  })
+  if (!res.ok) throw new Error(`Failed to patch config: ${res.status}`)
+  return res.json()
+}
+
+// GET /queue — current queue depth + active job count
+export async function getServerQueue() {
+  const res = await fetch(`${SERVER}/queue`)
+  if (!res.ok) throw new Error(`Failed to get queue: ${res.status}`)
+  return res.json()  // { concurrency, active, queued, queue: [...] }
+}

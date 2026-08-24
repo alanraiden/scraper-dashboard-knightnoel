@@ -49,6 +49,76 @@ PORT = 7832
 jobs      = {}
 jobs_lock = threading.Lock()
 
+# -- Concurrency-limited job queue --------------------------------------------
+# Only WATCH_CONCURRENCY jobs run at the same time; the rest wait in job_queue.
+# Can be changed at runtime via PATCH /config without restarting the server.
+WATCH_CONCURRENCY = 1          # default — 1 is safest for low-spec servers; frontend slider overrides
+_concurrency_lock  = threading.Lock()
+_semaphore         = threading.Semaphore(WATCH_CONCURRENCY)  # real gate
+job_queue          = []         # list of (job_id, params) waiting to run
+job_queue_lock     = threading.Lock()
+
+# -- Stagger delay ------------------------------------------------------------
+# Seconds to sleep BEFORE starting each new job from the queue (after a slot
+# becomes free). Spreads server load over time. 0 = no delay.
+# Can be changed at runtime via PATCH /config.
+STAGGER_DELAY      = 0.0       # seconds (0 = off)
+
+
+def _dispatch_loop():
+    """Background thread: pulls jobs off job_queue as semaphore slots free up."""
+    while True:
+        with job_queue_lock:
+            pending = job_queue[:]
+        if not pending:
+            time.sleep(0.2)
+            continue
+        # Try to acquire a slot (non-blocking peek so we don't hold the lock)
+        acquired = _semaphore.acquire(blocking=False)
+        if not acquired:
+            time.sleep(0.3)
+            continue
+        # Got a slot — pop the first job and run it
+        with job_queue_lock:
+            if not job_queue:
+                _semaphore.release()   # nothing to run, release immediately
+                continue
+            job_id, params = job_queue.pop(0)
+        with jobs_lock:
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                _semaphore.release()   # cancelled while queued — skip it
+                continue
+            jobs[job_id]["status"] = "starting"
+
+        # ── Stagger delay: sleep before actually launching the thread ──────
+        # This spreads load over time even when multiple slots are available.
+        stagger = STAGGER_DELAY
+        if stagger > 0:
+            time.sleep(stagger)
+            # Re-check cancellation after sleeping
+            with jobs_lock:
+                if jobs.get(job_id, {}).get("status") == "cancelled":
+                    _semaphore.release()
+                    continue
+
+        def _run(jid=job_id, p=params):
+            try:
+                run_scrape_job(jid, p)
+            finally:
+                _semaphore.release()   # always free the slot when done
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id]["thread"] = t
+
+
+# Start dispatcher once at import time
+_dispatcher = threading.Thread(target=_dispatch_loop, daemon=True, name="job-dispatcher")
+_dispatcher.start()
+
+
 # -- Scraper config -----------------------------------------------------------
 DEFAULT_DELAY      = 1.2
 MAX_CONSECUTIVE_SKIPS = 5   # stop crawl after this many locked/empty chapters in a row
@@ -541,12 +611,100 @@ def run_scrape_job(job_id, params):
 
 @app.route("/health", methods=["GET", "OPTIONS"])
 def health():
+    with job_queue_lock:
+        queued = len(job_queue)
+    with _concurrency_lock:
+        limit = WATCH_CONCURRENCY
+        stagger = STAGGER_DELAY
+    active = limit - _semaphore._value   # slots in use
     return jsonify({
-        "status":    "ok",
-        "port":      PORT,
-        "min_words": MIN_CONTENT_WORDS,
-        "gemini":    gemini_status(),
+        "status":       "ok",
+        "port":         PORT,
+        "min_words":    MIN_CONTENT_WORDS,
+        "gemini":       gemini_status(),
+        "concurrency":  limit,
+        "stagger_delay": stagger,
+        "active_jobs":  max(0, active),
+        "queued_jobs":  queued,
     })
+
+
+@app.route("/queue", methods=["GET"])
+def get_queue():
+    """Return current queue depth, active job count, and concurrency limit."""
+    with job_queue_lock:
+        queue_items = [(jid, p.get("novel_slug") or p.get("novel_id", "?"))
+                       for jid, p in job_queue]
+    with _concurrency_lock:
+        limit = WATCH_CONCURRENCY
+    active = max(0, limit - _semaphore._value)
+    return jsonify({
+        "concurrency":  limit,
+        "active":       active,
+        "queued":       len(queue_items),
+        "queue":        [{"job_id": jid, "novel": nov} for jid, nov in queue_items],
+    })
+
+
+@app.route("/config", methods=["GET", "PATCH"])
+def config():
+    """GET returns current config; PATCH updates concurrency limit and/or stagger delay."""
+    global WATCH_CONCURRENCY, STAGGER_DELAY, _semaphore
+    if request.method == "GET":
+        with _concurrency_lock:
+            return jsonify({
+                "concurrency":   WATCH_CONCURRENCY,
+                "stagger_delay": STAGGER_DELAY,
+            })
+
+    body = request.json or {}
+
+    # ── Update concurrency if provided ────────────────────────────────────
+    new_val = body.get("concurrency")
+    if new_val is not None:
+        try:
+            new_val = int(new_val)
+            if not (1 <= new_val <= 20):
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({"error": "concurrency must be an integer 1-20"}), 400
+
+        with _concurrency_lock:
+            old = WATCH_CONCURRENCY
+            WATCH_CONCURRENCY = new_val
+            # Adjust semaphore capacity by releasing/acquiring delta slots
+            diff = new_val - old
+            if diff > 0:
+                for _ in range(diff):
+                    _semaphore.release()   # add slots
+            elif diff < 0:
+                # Reduce capacity: acquire slots (non-blocking — existing running jobs
+                # finish normally, we just stop new ones from starting until level drops)
+                for _ in range(-diff):
+                    if _semaphore.acquire(blocking=False):
+                        pass
+                    else:
+                        break          # semaphore already at 0 — running jobs will drain
+
+    # ── Update stagger delay if provided ──────────────────────────────────
+    new_stagger = body.get("stagger_delay")
+    if new_stagger is not None:
+        try:
+            new_stagger = float(new_stagger)
+            if not (0.0 <= new_stagger <= 120.0):
+                raise ValueError
+        except (ValueError, TypeError):
+            return jsonify({"error": "stagger_delay must be a number 0-120"}), 400
+        with _concurrency_lock:
+            STAGGER_DELAY = new_stagger
+
+    with _concurrency_lock:
+        return jsonify({
+            "ok":            True,
+            "concurrency":   WATCH_CONCURRENCY,
+            "stagger_delay": STAGGER_DELAY,
+        })
+
 
 
 @app.route("/jobs", methods=["POST"])
@@ -558,12 +716,11 @@ def create_job():
         return jsonify({"error": "novel_slug or novel_id is required"}), 400
     job_id = str(uuid.uuid4())[:8]
     with jobs_lock:
-        jobs[job_id] = {"status": "pending", "logs": [], "stats": {}}
-    t = threading.Thread(target=run_scrape_job, args=(job_id, params), daemon=True)
-    t.start()
-    with jobs_lock:
-        jobs[job_id]["thread"] = t
+        jobs[job_id] = {"status": "queued", "logs": [], "stats": {}}
+    with job_queue_lock:
+        job_queue.append((job_id, params))
     return jsonify({"job_id": job_id})
+
 
 
 @app.route("/jobs/<job_id>", methods=["GET"])

@@ -9,6 +9,7 @@ import {
   checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter,
   getServerWatches, upsertServerWatch, deleteServerWatch,
   startServerWatch, stopServerWatch, runServerWatchNow, patchServerWatch,
+  patchServerConfig,
 } from '../lib/localScraper.js'
 import { saveJobToHistory } from '../components/JobHistory.jsx'
 import { loadWatermarks }   from '../components/WatermarkEditor.jsx'
@@ -42,12 +43,62 @@ function watchToServer(w) {
   }
 }
 
+const CONCURRENCY_KEY = 'kn_watch_concurrency'
+const STAGGER_KEY     = 'kn_stagger_delay'
+
+function loadConcurrency() {
+  const v = parseInt(localStorage.getItem(CONCURRENCY_KEY) || '1', 10)
+  return Number.isFinite(v) && v >= 1 ? Math.min(v, 10) : 1
+}
+function loadStaggerDelay() {
+  const v = parseFloat(localStorage.getItem(STAGGER_KEY) || '0')
+  return Number.isFinite(v) && v >= 0 ? Math.min(v, 60) : 0
+}
+
 export function useWatcher(addLog) {
-  const [watched,     setWatched]     = useState(loadWatched)
-  const [running,     setRunning]     = useState({})
-  const [serverOnline,setServerOnline]= useState(false)
-  const timersRef  = useRef({})
-  const healthRef  = useRef(null)
+  const [watched,          setWatched]          = useState(loadWatched)
+  const [running,          setRunning]          = useState({})
+  const [serverOnline,     setServerOnline]     = useState(false)
+  const [concurrencyLimit, _setConcurrencyLimit]= useState(loadConcurrency)
+  const [staggerDelay,     _setStaggerDelay]    = useState(loadStaggerDelay)
+  const [queueLength,      setQueueLength]      = useState(0)
+  // ── Batch scrape progress ─────────────────────────────────────────────────
+  const [batchProgress,    setBatchProgress]    = useState(null) // null | { total, done, active }
+  const batchCancelRef = useRef(false)
+  const timersRef      = useRef({})
+  const healthRef      = useRef(null)
+  // ── Semaphore state (mutable refs — never trigger re-renders) ─────────────
+  const activeRef      = useRef(0)   // how many slots are currently occupied
+  const waitQueueRef   = useRef([])  // [{ novelId, resolve }] waiting for a slot
+  const concLimitRef   = useRef(loadConcurrency())
+
+  const setConcurrencyLimit = useCallback((val) => {
+    const n = Math.max(1, Math.min(10, Number(val) || 1))
+    concLimitRef.current = n
+    _setConcurrencyLimit(n)
+    localStorage.setItem(CONCURRENCY_KEY, String(n))
+    // Push to Python server
+    patchServerConfig({ concurrency: n }).catch(() => {})
+    // Drain the queue if the new limit allows more slots
+    _drainQueue()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setStaggerDelay = useCallback((val) => {
+    const s = Math.max(0, Math.min(60, Number(val) || 0))
+    _setStaggerDelay(s)
+    localStorage.setItem(STAGGER_KEY, String(s))
+    // Push to Python server
+    patchServerConfig({ stagger_delay: s }).catch(() => {})
+  }, [])
+
+  function _drainQueue() {
+    while (activeRef.current < concLimitRef.current && waitQueueRef.current.length > 0) {
+      const next = waitQueueRef.current.shift()
+      setQueueLength(waitQueueRef.current.length)
+      activeRef.current++
+      next.resolve()
+    }
+  }
 
   useEffect(() => { saveWatched(watched) }, [watched])
 
@@ -119,7 +170,8 @@ export function useWatcher(addLog) {
   }, [updateWatch, addLog])
 
   // ── Core check: runs via local server if available, else browser scraper ──
-  const runCheck = useCallback(async (novelId) => {
+  // Private impl — called only after the semaphore grants a slot
+  const _doRunCheck = useCallback(async (novelId) => {
     setRunning(prev => ({ ...prev, [novelId]: true }))
 
     const currentList = loadWatched()
@@ -360,6 +412,64 @@ export function useWatcher(addLog) {
     setRunning(prev => ({ ...prev, [novelId]: false }))
   }, [addLog])
 
+  // ── Public runCheck — enqueues then delegates to _doRunCheck ─────────────
+  const runCheck = useCallback(async (novelId) => {
+    // If a slot is free, take it immediately; otherwise wait in queue
+    if (activeRef.current < concLimitRef.current) {
+      activeRef.current++
+    } else {
+      await new Promise((resolve) => {
+        waitQueueRef.current.push({ novelId, resolve })
+        setQueueLength(waitQueueRef.current.length)
+      })
+    }
+    try {
+      await _doRunCheck(novelId)
+    } finally {
+      activeRef.current--
+      _drainQueue()
+    }
+  }, [_doRunCheck]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Batch scrape: fire all watched novels sequentially with stagger ──────
+  const batchScrapeAll = useCallback(async (novelList) => {
+    if (!novelList || novelList.length === 0) return
+    batchCancelRef.current = false
+    setBatchProgress({ total: novelList.length, done: 0, active: 0 })
+
+    const promises = []
+    for (let i = 0; i < novelList.length; i++) {
+      if (batchCancelRef.current) break
+      const novel = novelList[i]
+
+      // Respect stagger delay between submissions
+      if (i > 0) {
+        const delay = parseFloat(localStorage.getItem(STAGGER_KEY) || '0') * 1000
+        if (delay > 0) await sleep(delay)
+      }
+      if (batchCancelRef.current) break
+
+      setBatchProgress(prev => prev ? { ...prev, active: (prev.active || 0) + 1 } : null)
+      const p = runCheck(novel._id || novel.novelId).then(() => {
+        setBatchProgress(prev => prev
+          ? { ...prev, done: prev.done + 1, active: Math.max(0, (prev.active || 1) - 1) }
+          : null
+        )
+      })
+      promises.push(p)
+    }
+
+    // Wait for all that were dispatched
+    await Promise.allSettled(promises)
+    setBatchProgress(null)
+    batchCancelRef.current = false
+  }, [runCheck])
+
+  const cancelBatch = useCallback(() => {
+    batchCancelRef.current = true
+    setBatchProgress(null)
+  }, [])
+
   const startWatch = useCallback((novelId, intervalHours = 1) => {
     if (timersRef.current[novelId]) return
     runCheck(novelId)
@@ -411,6 +521,9 @@ export function useWatcher(addLog) {
     watched, addWatch, removeWatch, updateWatch, runCheck,
     startWatch, stopWatch, running, isWatching, resetChapter,
     updateChainUrl, serverOnline,
+    concurrencyLimit, setConcurrencyLimit, queueLength,
+    staggerDelay, setStaggerDelay,
+    batchScrapeAll, cancelBatch, batchProgress,
   }
 }
 

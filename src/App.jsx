@@ -46,8 +46,14 @@ export default function App() {
     }))
   }, [])
 
-  // ── Watcher hook ──────────────────────────────────────────────────────────
-  const { watched, addWatch, removeWatch, updateWatch, runCheck, startWatch, stopWatch, running, isWatching, resetChapter, updateChainUrl, serverOnline } = useWatcher(addLog)
+  // ── Watcher hook ────────────────────────────────────────────
+  const {
+    watched, addWatch, removeWatch, updateWatch, runCheck,
+    startWatch, stopWatch, running, isWatching, resetChapter, updateChainUrl,
+    serverOnline, concurrencyLimit, setConcurrencyLimit, queueLength,
+    staggerDelay, setStaggerDelay,
+    batchScrapeAll, cancelBatch, batchProgress,
+  } = useWatcher(addLog)
 
   // ── Auto-login if creds saved ─────────────────────────────────────────────
   useEffect(() => {
@@ -224,9 +230,92 @@ export default function App() {
             )}
           </div>
 
+          {/* ── Queue control panel ── */}
+          <div className={styles.queuePanel}>
+            <div className={styles.queuePanelTitle}>⚙ Queue Settings</div>
+
+            {/* Concurrency slider */}
+            <div className={styles.sliderRow}>
+              <div className={styles.sliderHeader}>
+                <span className={styles.sliderLabel}>Concurrent jobs</span>
+                <span className={styles.sliderValue}>{concurrencyLimit}</span>
+              </div>
+              <input
+                id="concurrency-slider"
+                type="range" min="1" max="10" step="1"
+                value={concurrencyLimit}
+                className={styles.queueSlider}
+                onChange={e => setConcurrencyLimit(Number(e.target.value))}
+                title={`${concurrencyLimit} novel${concurrencyLimit !== 1 ? 's' : ''} scraping at once`}
+              />
+              <div className={styles.sliderHint}>1 = safe &nbsp;·&nbsp; 5 = fast</div>
+            </div>
+
+            {/* Stagger delay slider */}
+            <div className={styles.sliderRow}>
+              <div className={styles.sliderHeader}>
+                <span className={styles.sliderLabel}>Stagger delay</span>
+                <span className={styles.sliderValue}>{staggerDelay}s</span>
+              </div>
+              <input
+                id="stagger-slider"
+                type="range" min="0" max="30" step="1"
+                value={staggerDelay}
+                className={styles.queueSlider}
+                onChange={e => setStaggerDelay(Number(e.target.value))}
+                title={`Wait ${staggerDelay}s before starting each new job`}
+              />
+              <div className={styles.sliderHint}>0 = none &nbsp;·&nbsp; 30s = gentle</div>
+            </div>
+
+            {/* Batch scrape button + progress */}
+            {batchProgress ? (
+              <div className={styles.batchProgressWrap}>
+                <div className={styles.batchProgressBar}>
+                  <div
+                    className={styles.batchProgressFill}
+                    style={{ width: `${Math.round((batchProgress.done / batchProgress.total) * 100)}%` }}
+                  />
+                </div>
+                <div className={styles.batchProgressStats}>
+                  {batchProgress.done}/{batchProgress.total} done
+                  {batchProgress.active > 0 && <span> · {batchProgress.active} active</span>}
+                  {queueLength > 0 && <span> · {queueLength} queued</span>}
+                </div>
+                <button
+                  id="cancel-batch-btn"
+                  className={`${styles.batchBtn} ${styles.batchBtnStop}`}
+                  onClick={cancelBatch}
+                >
+                  ✕ Cancel batch
+                </button>
+              </div>
+            ) : (
+              <button
+                id="batch-scrape-btn"
+                className={styles.batchBtn}
+                disabled={watched.length === 0}
+                title={watched.length === 0 ? 'Add some watched novels first' : `Run watch-check on all ${watched.length} watched novels`}
+                onClick={() => {
+                  // Build the novel list from watched entries, filtered to those in the current view
+                  const targets = watched.map(w => ({ _id: w.novelId, novelId: w.novelId }))
+                  batchScrapeAll(targets)
+                }}
+              >
+                ⚡ Batch Scrape All Watched ({watched.length})
+              </button>
+            )}
+          </div>
+
+          {/* Running / queue status badges */}
           {runningCount > 0 && (
             <div className={styles.runningBadge}>
               <RefreshCw size={11} className={styles.spin}/> {runningCount} check{runningCount !== 1 ? 's' : ''} running
+            </div>
+          )}
+          {queueLength > 0 && !batchProgress && (
+            <div className={styles.queueBadge}>
+              ⏳ {queueLength} check{queueLength !== 1 ? 's' : ''} queued
             </div>
           )}
 

@@ -68,6 +68,141 @@
   border-radius: var(--radius-sm); padding: 7px 10px;
 }
 
+/* ── Queue control panel ───────────────────────────────── */
+.queuePanel {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.queuePanelTitle {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* Slider rows */
+.sliderRow { display: flex; flex-direction: column; gap: 4px; }
+.sliderHeader { display: flex; align-items: center; justify-content: space-between; }
+.sliderLabel { font-size: 11px; font-weight: 600; color: var(--text); }
+.sliderValue {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--accent);
+  min-width: 26px;
+  text-align: right;
+}
+.sliderHint { font-size: 9px; color: var(--muted); letter-spacing: 0.04em; }
+
+/* Styled range slider */
+.queueSlider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  outline: none;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.queueSlider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(232,197,71,0.4);
+  transition: box-shadow 0.15s;
+}
+.queueSlider::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 10px rgba(232,197,71,0.6);
+}
+.queueSlider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  cursor: pointer;
+}
+
+/* Batch scrape button */
+.batchBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  background: rgba(232,197,71,0.1);
+  border: 1px solid rgba(232,197,71,0.3);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.batchBtn:hover:not(:disabled) {
+  background: rgba(232,197,71,0.18);
+  border-color: rgba(232,197,71,0.5);
+}
+.batchBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+.batchBtnStop {
+  background: rgba(255,107,107,0.1);
+  border-color: rgba(255,107,107,0.3);
+  color: var(--accent3);
+}
+.batchBtnStop:hover {
+  background: rgba(255,107,107,0.18);
+}
+
+/* Batch progress */
+.batchProgressWrap { display: flex; flex-direction: column; gap: 6px; }
+.batchProgressBar {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+.batchProgressFill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #fbbf24);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+  animation: shimmer 1.5s ease infinite;
+  background-size: 200% 100%;
+}
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.batchProgressStats {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  text-align: center;
+}
+.batchProgressStats span { color: var(--accent2); font-weight: 700; }
+
+/* ── Queue badge ──────────────────────────────────────── */
+.queueBadge {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px; color: #e8c547;
+  background: rgba(232,197,71,0.07); border: 1px solid rgba(232,197,71,0.22);
+  border-radius: var(--radius-sm); padding: 7px 10px;
+}
+
+
 /* ── Health panel ─────────────────────────────────────── */
 .healthPanel {
   background: rgba(255,107,107,0.06); border: 1px solid rgba(255,107,107,0.2);
