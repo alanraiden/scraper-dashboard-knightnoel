@@ -123,6 +123,14 @@ _PAYWALL_SIGNALS = [
     r"^403",
     r"chapter\s+not\s+found",
     r"this\s+chapter\s+does\s+not\s+exist",
+
+    # Knight Novel / CMS placeholder text
+    # Emitted by KN when a chapter page exists but has no real content yet.
+    r"this\s+is\s+placeholder\s+text",
+    r"real\s+chapter\s+content\s+will\s+appear\s+here",
+    r"added\s+via\s+the\s+admin\s+panel",
+    r"manual\s+entry\s+or\s+bulk\s+import",
+    r"MONGODB_URI\s+is\s+configured",
 ]
 
 _compiled_paywall = [re.compile(p, re.I) for p in _PAYWALL_SIGNALS]
