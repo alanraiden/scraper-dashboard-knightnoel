@@ -9,7 +9,7 @@ import {
   checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter,
   getServerWatches, upsertServerWatch, deleteServerWatch,
   startServerWatch, stopServerWatch, runServerWatchNow, patchServerWatch,
-  patchServerConfig,
+  patchServerConfig, listJobs, pauseJob, resumeJob, pollJob,
 } from '../lib/localScraper.js'
 import { saveJobToHistory } from '../components/JobHistory.jsx'
 import { loadWatermarks }   from '../components/WatermarkEditor.jsx'
@@ -62,6 +62,10 @@ export function useWatcher(addLog) {
   const [concurrencyLimit, _setConcurrencyLimit]= useState(loadConcurrency)
   const [staggerDelay,     _setStaggerDelay]    = useState(loadStaggerDelay)
   const [queueLength,      setQueueLength]      = useState(0)
+  // jobQueueState: { [novelId]: position (1-based) } for queued novels
+  const [jobQueueState,    setJobQueueState]    = useState({})
+  // jobRunData: { [novelId]: { jobId, startedAt } } for actively running server jobs
+  const [jobRunData,       setJobRunData]       = useState({})
   // ── Batch scrape progress ─────────────────────────────────────────────────
   const [batchProgress,    setBatchProgress]    = useState(null) // null | { total, done, active }
   const batchCancelRef = useRef(false)
@@ -95,9 +99,18 @@ export function useWatcher(addLog) {
     while (activeRef.current < concLimitRef.current && waitQueueRef.current.length > 0) {
       const next = waitQueueRef.current.shift()
       setQueueLength(waitQueueRef.current.length)
+      // Rebuild position map after shift
+      _rebuildQueueState()
       activeRef.current++
       next.resolve()
     }
+  }
+
+  // Rebuild jobQueueState from current waitQueueRef contents (1-based positions)
+  function _rebuildQueueState() {
+    const map = {}
+    waitQueueRef.current.forEach((item, i) => { map[item.novelId] = i + 1 })
+    setJobQueueState(map)
   }
 
   useEffect(() => { saveWatched(watched) }, [watched])
@@ -236,29 +249,20 @@ export function useWatcher(addLog) {
       const apiUrl = localStorage.getItem('kn_api_url') || localStorage.getItem('ns_api_url') || ''
       const token  = localStorage.getItem('kn_scraper_key') || localStorage.getItem('ns_token')   || ''
 
-      // For watch_check:
-      //   index mode  → start_url must be the novel INDEX page
-      //   latest mode → start_url must be the latest chapter page
-      // chapterOneUrl is the chapter-1 URL used only for full scrapes, not watch checks.
-      const watchUrl = entry.startUrl  // always the index/latest URL set by user in NovelCard
-
+      const crawlStartUrl = entry.mode === 'chain'
+        ? (entry.lastChapterUrl || entry.startUrl)
+        : (entry.chapterOneUrl || entry.startUrl)
       let jobId
       try {
-        // For chain mode, crawl starts from the last known chapter URL (not chapter-1)
-        const crawlStartUrl = entry.mode === 'chain'
-          ? (entry.lastChapterUrl || entry.startUrl)
-          : (entry.chapterOneUrl || entry.startUrl)
         jobId = await startJob({
           mode:             'watch_check',
           start_url:        entry.mode === 'chain' ? crawlStartUrl : entry.startUrl,
           chapter_one_url:  crawlStartUrl,
           novel_id:         novelId,
-          novel_slug:       novelSlug,   // ← use resolved slug (backfilled from novels list if missing)
+          novel_slug:       novelSlug,
           api_url:          apiUrl,
           token:            token,
           from_chapter:     storedLast,
-          // Chain mode: server starts crawling from the last known chapter page,
-          // so index starts at storedLast (not 1) — fixes infer_chapter_number fallback
           index_offset:     entry.mode === 'chain' ? storedLast : 0,
           delay:            entry.delay || 1.2,
           max_chapters:     500,
@@ -272,6 +276,8 @@ export function useWatcher(addLog) {
         return
       }
 
+      // Track the active job ID so runNow can pause it if needed
+      setJobRunData(prev => ({ ...prev, [novelId]: { jobId, startedAt: Date.now() } }))
       addLog(novelId, `Server job started (id: ${jobId})`, 'dim')
 
       await new Promise((resolve) => {
@@ -281,7 +287,6 @@ export function useWatcher(addLog) {
         const jobLogs       = []
         const cleanup = streamJob(jobId, {
           onLog: (entry) => {
-            // Intercept the chain-mode URL marker — don't show it in the UI
             if (entry.msg.startsWith('__last_chapter_url__:')) {
               lastUploadedUrl = entry.msg.replace('__last_chapter_url__:', '').trim()
               return
@@ -296,7 +301,6 @@ export function useWatcher(addLog) {
           },
           onStats: () => {},
           onDone: (stats) => {
-            // Save to job history
             saveJobToHistory({
               id:         jobId,
               novelId,
@@ -312,7 +316,6 @@ export function useWatcher(addLog) {
               setWatched(prev => prev.map(w => {
                 if (w.novelId !== novelId) return w
                 const patch = { lastChapter: highestUploaded, lastChecked: Date.now() }
-                // Chain mode: update the stored chapter URL to the last one uploaded
                 if (w.mode === 'chain' && lastUploadedUrl) patch.lastChapterUrl = lastUploadedUrl
                 return { ...w, ...patch }
               }))
@@ -327,6 +330,9 @@ export function useWatcher(addLog) {
         })
       })
 
+      // Clear job run data after completion
+      setJobRunData(prev => { const n = { ...prev }; delete n[novelId]; return n })
+
     } else {
       // ── Path B: Browser scraper fallback ──────────────────────────────────
       addLog(novelId, `── Watch check (browser scraper — local server not running) ──`, 'warn')
@@ -334,7 +340,7 @@ export function useWatcher(addLog) {
 
       const browserJobId  = `browser-${Date.now()}`
       const browserStart  = Date.now()
-      const browserLogs   = []   // collect logs locally since we can't access App's logs state
+      const browserLogs   = []
       const logAndCollect = (msg, type) => {
         addLog(novelId, msg, type)
         browserLogs.push({ msg, type, ts: Date.now() })
@@ -385,7 +391,6 @@ export function useWatcher(addLog) {
       setWatched(prev => prev.map(w => {
         if (w.novelId !== novelId) return w
         const patch = { lastChapter: highestUploaded, lastChecked: Date.now() }
-        // Chain mode: save the URL of the highest uploaded chapter so next check starts from there
         if (w.mode === 'chain') {
           const highestCh = uploadable.find(ch => ch.number === highestUploaded)
           if (highestCh?.url) patch.lastChapterUrl = highestCh.url
@@ -418,11 +423,15 @@ export function useWatcher(addLog) {
     if (activeRef.current < concLimitRef.current) {
       activeRef.current++
     } else {
+      // Add to wait queue and expose position in UI immediately
       await new Promise((resolve) => {
         waitQueueRef.current.push({ novelId, resolve })
+        _rebuildQueueState()
         setQueueLength(waitQueueRef.current.length)
       })
     }
+    // Clear queued state now that we have a slot
+    setJobQueueState(prev => { const n = { ...prev }; delete n[novelId]; return n })
     try {
       await _doRunCheck(novelId)
     } finally {
@@ -430,6 +439,127 @@ export function useWatcher(addLog) {
       _drainQueue()
     }
   }, [_doRunCheck]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Run Next: promote a queued novel to position #1 in the wait queue ────
+  const runNext = useCallback((novelId) => {
+    const queue = waitQueueRef.current
+    const idx = queue.findIndex(item => item.novelId === novelId)
+    if (idx <= 0) return  // already at front or not queued
+    const [item] = queue.splice(idx, 1)
+    queue.unshift(item)
+    _rebuildQueueState()
+    addLog(novelId, `⬆ Moved to front of queue (Run Next)`, 'info')
+  }, [addLog]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Run Now: force-start immediately, pausing the oldest running job ──────
+  // Returns a promise that resolves once the novel has started running
+  // (the interrupted job is auto-resumed after this one finishes).
+  const runNow = useCallback(async (novelId) => {
+    // If a slot is available, just run normally
+    if (activeRef.current < concLimitRef.current) {
+      // Remove from wait queue if it was queued
+      const idx = waitQueueRef.current.findIndex(i => i.novelId === novelId)
+      if (idx !== -1) {
+        const [item] = waitQueueRef.current.splice(idx, 1)
+        _rebuildQueueState()
+        setQueueLength(waitQueueRef.current.length)
+        item.resolve()  // let the existing runCheck flow continue
+      } else {
+        runCheck(novelId)
+      }
+      return
+    }
+
+    // All slots are busy — find the oldest running job on the server to pause
+    let victimNovelId = null
+    let victimJobId   = null
+    try {
+      const { jobs: serverJobs } = await listJobs()
+      // Find the oldest running job that is NOT this novel
+      let oldestStarted = Infinity
+      for (const [jid, jinfo] of Object.entries(serverJobs)) {
+        if (jinfo.status !== 'running') continue
+        // Match server job to a novel ID via jobRunData
+        // jobRunData: { [novelId]: { jobId } }
+        // We'll check if this jid is in our tracked jobs
+        const matchedNovelId = Object.keys(jobRunData).find(nid => jobRunData[nid]?.jobId === jid)
+        if (!matchedNovelId || matchedNovelId === novelId) continue
+        const startedAt = jinfo.started_at || 0
+        if (startedAt < oldestStarted) {
+          oldestStarted  = startedAt
+          victimJobId    = jid
+          victimNovelId  = matchedNovelId
+        }
+      }
+    } catch (e) {
+      // Server not available — fall through to normal queue
+      addLog(novelId, `Could not query server jobs: ${e.message} — queuing normally`, 'warn')
+      runCheck(novelId)
+      return
+    }
+
+    if (!victimJobId) {
+      // No running job found to pause (maybe browser-mode job) — queue normally
+      addLog(novelId, `No pausable server job found — queuing`, 'info')
+      runCheck(novelId)
+      return
+    }
+
+    // Request graceful pause of victim job
+    addLog(victimNovelId, `⏸ Job paused to give priority to another novel (will resume automatically)`, 'warn')
+    addLog(novelId, `⚡ Run Now — pausing job ${victimJobId} to take its slot`, 'info')
+    try {
+      await pauseJob(victimJobId)
+    } catch (e) {
+      addLog(novelId, `Could not pause job: ${e.message} — queuing normally`, 'warn')
+      runCheck(novelId)
+      return
+    }
+
+    // Wait for the victim job to actually enter paused state (poll up to 30 chapters × 2s = 60s)
+    // In practice it stops at the next chapter boundary which is usually under 5s
+    for (let i = 0; i < 30; i++) {
+      await sleep(2000)
+      try {
+        const info = await pollJob(victimJobId)
+        if (info.status === 'paused') break
+        if (info.status === 'done' || info.status === 'cancelled') break
+      } catch { break }
+    }
+
+    // The victim's slot is now free — acquire it for our novel
+    // We do NOT go through the semaphore (activeRef stays at max) because we
+    // are conceptually replacing one running job with another
+    addLog(novelId, `⚡ Slot acquired — starting now`, 'info')
+
+    // Remove from wait queue if it was there
+    const idx = waitQueueRef.current.findIndex(i => i.novelId === novelId)
+    if (idx !== -1) {
+      waitQueueRef.current.splice(idx, 1)
+      _rebuildQueueState()
+      setQueueLength(waitQueueRef.current.length)
+    }
+
+    setRunning(prev => ({ ...prev, [novelId]: true }))
+    try {
+      await _doRunCheck(novelId)
+    } finally {
+      setRunning(prev => ({ ...prev, [novelId]: false }))
+      // Auto-resume the paused job
+      if (victimJobId) {
+        addLog(victimNovelId, `▶ Auto-resuming paused job after priority job finished`, 'info')
+        try {
+          await resumeJob(victimJobId)
+        } catch (e) {
+          addLog(victimNovelId, `Could not auto-resume: ${e.message} — use Check Now to retry`, 'warn')
+        }
+      }
+      // We borrowed a slot without touching activeRef/semaphore,
+      // so we need to release one now to keep counts accurate
+      activeRef.current--
+      _drainQueue()
+    }
+  }, [runCheck, _doRunCheck, addLog, jobRunData]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Batch scrape: fire all watched novels sequentially with stagger ──────
   const batchScrapeAll = useCallback(async (novelList) => {
@@ -524,6 +654,11 @@ export function useWatcher(addLog) {
     concurrencyLimit, setConcurrencyLimit, queueLength,
     staggerDelay, setStaggerDelay,
     batchScrapeAll, cancelBatch, batchProgress,
+    // ── New job priority exports ──────────────────────────────────────────
+    jobQueueState,   // { [novelId]: queuePosition (1-based) }
+    jobRunData,      // { [novelId]: { jobId, startedAt } }
+    runNext,         // (novelId) => void — promote queued novel to front
+    runNow,          // (novelId) => Promise — force-start, pausing another job
   }
 }
 

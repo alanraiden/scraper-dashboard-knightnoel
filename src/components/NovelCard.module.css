@@ -168,3 +168,133 @@
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(99,102,241,0.15);
 }
+
+/* ── Queue / priority status pills ──────────────────────────────────────────── */
+.pillQueued {
+  color: #fb923c;
+  border-color: rgba(251,146,60,0.35);
+  background: rgba(251,146,60,0.1);
+  animation: pulse-queued 2s ease-in-out infinite;
+}
+.pillPaused {
+  color: #818cf8;
+  border-color: rgba(129,140,248,0.35);
+  background: rgba(129,140,248,0.08);
+}
+
+@keyframes pulse-queued {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.65; }
+}
+
+/* ── Run Next button ─────────────────────────────────────────────────────────── */
+.btnRunNext {
+  font-size: 14px;
+  font-weight: 800;
+  color: #fb923c;
+}
+.btnRunNext:hover {
+  border-color: rgba(251,146,60,0.5);
+  background: rgba(251,146,60,0.12);
+  color: #fb923c;
+}
+
+/* ── Check Now queued state (amber ring) ─────────────────────────────────────── */
+.btnQueued {
+  border-color: rgba(251,146,60,0.5) !important;
+  color: #fb923c !important;
+  background: rgba(251,146,60,0.06) !important;
+}
+
+/* ── Run Now button ──────────────────────────────────────────────────────────── */
+.btnRunNow {
+  font-size: 13px;
+  color: var(--accent2);
+}
+.btnRunNow:hover {
+  border-color: rgba(78,205,196,0.5);
+  background: rgba(78,205,196,0.1);
+  color: var(--accent2);
+}
+
+/* ── Run Now confirmation dialog ─────────────────────────────────────────────── */
+.confirmOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: fadeIn 0.15s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+.confirmDialog {
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 14px;
+  padding: 28px 28px 24px;
+  max-width: 380px;
+  width: 90vw;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: slideUp 0.18s ease;
+}
+@keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+.confirmIcon {
+  font-size: 32px;
+  line-height: 1;
+}
+.confirmTitle {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text);
+}
+.confirmBody {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.confirmNote {
+  display: block;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted2);
+  font-family: var(--mono);
+}
+.confirmActions {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+}
+.confirmRunBtn {
+  flex: 1;
+  background: linear-gradient(135deg, var(--accent2), #60a5fa);
+  color: #0d0e12;
+  font-weight: 800;
+  font-size: 13px;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 10px 0;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.confirmRunBtn:hover { opacity: 0.9; transform: translateY(-1px); }
+.confirmRunBtn:active { transform: translateY(0); }
+
+.confirmCancelBtn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 13px;
+  border-radius: var(--radius-sm);
+  padding: 10px 0;
+  transition: all 0.15s;
+}
+.confirmCancelBtn:hover { border-color: var(--border2); color: var(--text); }

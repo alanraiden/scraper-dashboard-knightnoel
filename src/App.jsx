@@ -53,6 +53,8 @@ export default function App() {
     serverOnline, concurrencyLimit, setConcurrencyLimit, queueLength,
     staggerDelay, setStaggerDelay,
     batchScrapeAll, cancelBatch, batchProgress,
+    // ── Job priority ───────────────────────────────────────────────────────
+    jobQueueState, jobRunData, runNext, runNow,
   } = useWatcher(addLog)
 
   // ── Auto-login if creds saved ─────────────────────────────────────────────
@@ -536,6 +538,11 @@ export default function App() {
                     onUpdateChainUrl={updateChainUrl}
                     novelCollections={collections.filter(c => (novelColMap[novel._id] || []).includes(c.id))}
                     onStatusChange={(id, statusId) => setNovelStatuses(loadNovelStatuses())}
+                    isQueued={!!jobQueueState[novel._id]}
+                    queuePosition={jobQueueState[novel._id] || null}
+                    runNext={runNext}
+                    runNow={runNow}
+                    jobRunData={jobRunData}
                   />
                   {/* Scrape button outside card */}
                   <button className={styles.scrapeBtn} title="One-shot scrape" onClick={() => setScrapeTarget(novel)}>

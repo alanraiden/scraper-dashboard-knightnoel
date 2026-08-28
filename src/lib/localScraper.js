@@ -186,3 +186,30 @@ export async function getServerQueue() {
   if (!res.ok) throw new Error(`Failed to get queue: ${res.status}`)
   return res.json()  // { concurrency, active, queued, queue: [...] }
 }
+
+// GET /jobs — list all known server jobs with their statuses
+export async function listJobs() {
+  const res = await fetch(`${SERVER}/jobs`)
+  if (!res.ok) throw new Error(`Failed to list jobs: ${res.status}`)
+  return res.json()  // { jobs: { [job_id]: { status, started_at, novel_slug, ... } } }
+}
+
+// POST /jobs/<id>/pause — request graceful pause at next chapter boundary
+export async function pauseJob(jobId) {
+  const res = await fetch(`${SERVER}/jobs/${jobId}/pause`, { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || `Server error ${res.status}`)
+  }
+  return res.json()  // { ok, message }
+}
+
+// POST /jobs/<id>/resume — re-queue a paused job from its checkpoint
+export async function resumeJob(jobId) {
+  const res = await fetch(`${SERVER}/jobs/${jobId}/resume`, { method: 'POST' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || `Server error ${res.status}`)
+  }
+  return res.json()  // { ok, job_id, resumed_from }
+}

@@ -54,10 +54,31 @@ fi
 
 log "Update found: $(git rev-parse --short HEAD) -> $(git rev-parse --short origin/$BRANCH). Pulling..."
 
-# ---------------------------------------------------------------------------
-# Pull
-# ---------------------------------------------------------------------------
-git pull origin "$BRANCH" 2>&1 | logger -t "$LOG_TAG" || die "git pull failed"
+# Stash any local modifications so git pull never aborts.
+# This handles cases where the server has uncommitted edits (e.g. config tweaks).
+STASH_OUTPUT=$(git stash 2>&1)
+STASHED=false
+if echo "$STASH_OUTPUT" | grep -q "^Saved"; then
+    log "Local changes stashed before pull: $STASH_OUTPUT"
+    STASHED=true
+fi
+
+# Pull — capture output AND preserve exit code (no pipe-to-logger trick here)
+PULL_OUTPUT=$(git pull origin "$BRANCH" 2>&1)
+PULL_EXIT=$?
+echo "$PULL_OUTPUT" | logger -t "$LOG_TAG"
+if [[ $PULL_EXIT -ne 0 ]]; then
+    log "FATAL: git pull failed (exit $PULL_EXIT). Restoring stash if any."
+    $STASHED && git stash pop 2>&1 | logger -t "$LOG_TAG" || true
+    exit 1
+fi
+
+# Restore any stashed local changes on top of the new code
+if $STASHED; then
+    POP_OUTPUT=$(git stash pop 2>&1)
+    echo "$POP_OUTPUT" | logger -t "$LOG_TAG"
+    log "Stash restored after pull."
+fi
 
 # ---------------------------------------------------------------------------
 # Re-install Node deps only when package.json changed

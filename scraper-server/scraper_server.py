@@ -557,7 +557,7 @@ def run_scrape_job(job_id, params):
                 "ts":   int(time.time() * 1000),
             })
 
-    update({"status": "running", "logs": [], "stats": {"scraped": 0, "uploaded": 0, "skipped": 0, "errors": 0}})
+    update({"status": "running", "logs": [], "stats": {"scraped": 0, "uploaded": 0, "skipped": 0, "errors": 0}, "started_at": time.time()})
 
     mode          = params.get("mode", "scrape")
     start_url     = params["start_url"]
@@ -652,11 +652,29 @@ def run_scrape_job(job_id, params):
         last_real_chapter_url = None  # tracks highest chapter URL for chain mode
 
         while url and stats["scraped"] < max_chapters:
-            # Check if job was cancelled via DELETE /jobs/<id>
+            # Check if job was cancelled or paused
             with jobs_lock:
-                if jobs.get(job_id, {}).get("status") == "cancelled":
+                job_status = jobs.get(job_id, {}).get("status")
+                if job_status == "cancelled":
                     log("Job cancelled by user.", "warn")
                     break
+                if job_status == "pause_requested":
+                    # Save checkpoint so the job can be resumed later
+                    jobs[job_id]["checkpoint"] = {
+                        "from_chapter": max(stats.get("uploaded", 0), from_chapter),
+                        "last_url":     url,
+                    }
+                    jobs[job_id]["status"] = "paused"
+                    log(f"Job paused at Ch.~{jobs[job_id]['checkpoint']['from_chapter']} — will resume from {url}", "warn")
+                    # Flush any pending batch before pausing
+                    if upload_batch:
+                        created, errs = push_batch(upload_batch)
+                        stats["uploaded"] += created
+                        stats["errors"]   += len(errs)
+                        upload_batch.clear()
+                        push_stats()
+                    update({"stats": dict(stats)})
+                    return  # exit run_scrape_job; semaphore released by _dispatch_loop's finally
 
             if url in visited:
                 break
@@ -798,7 +816,14 @@ def create_job():
         return jsonify({"error": "admin_email and admin_password are required for auth_mode=nextauth"}), 400
     job_id = str(uuid.uuid4())[:8]
     with jobs_lock:
-        jobs[job_id] = {"status": "queued", "logs": [], "stats": {}}
+        jobs[job_id] = {
+            "status":     "queued",
+            "logs":       [],
+            "stats":      {},
+            "started_at": None,
+            "params":     params,   # saved for resume
+            "checkpoint": None,     # { from_chapter, last_url } set on pause
+        }
     with job_queue_lock:
         job_queue.append((job_id, params))
     return jsonify({"job_id": job_id})
@@ -881,16 +906,43 @@ def config():
         })
 
 
+@app.route("/jobs", methods=["GET"])
+def list_jobs():
+    """Return all known jobs with their status (used by Run Now to find what to pause)."""
+    with jobs_lock:
+        snapshot = {
+            jid: {
+                "status":     j.get("status"),
+                "started_at": j.get("started_at"),
+                "novel_slug": (j.get("params") or {}).get("novel_slug") or (j.get("params") or {}).get("novel_id"),
+                "novel_id":   (j.get("params") or {}).get("novel_id"),
+                "stats":      j.get("stats", {}),
+            }
+            for jid, j in jobs.items()
+        }
+    return jsonify({"jobs": snapshot})
+
+
 @app.route("/jobs/<job_id>", methods=["GET"])
 def get_job(job_id):
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
+    # Compute queue position if queued
+    queue_pos = None
+    with job_queue_lock:
+        for i, (qid, _) in enumerate(job_queue):
+            if qid == job_id:
+                queue_pos = i + 1   # 1-based
+                break
     return jsonify({
-        "status": job["status"],
-        "stats":  job.get("stats", {}),
-        "logs":   job.get("logs", []),
+        "status":         job["status"],
+        "stats":          job.get("stats", {}),
+        "logs":           job.get("logs", []),
+        "started_at":     job.get("started_at"),
+        "checkpoint":     job.get("checkpoint"),
+        "queue_position": queue_pos,
     })
 
 
@@ -928,7 +980,57 @@ def cancel_job(job_id):
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["status"] = "cancelled"
+    # Also remove from queue if it hasn't started yet
+    with job_queue_lock:
+        global job_queue
+        job_queue = [(jid, p) for jid, p in job_queue if jid != job_id]
     return jsonify({"ok": True})
+
+
+@app.route("/jobs/<job_id>/pause", methods=["POST"])
+def pause_job(job_id):
+    """Gracefully pause a running job at the next chapter boundary."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] not in ("running", "starting"):
+            return jsonify({"error": f"Cannot pause job in status '{job['status']}'"}), 409
+        job["status"] = "pause_requested"
+    return jsonify({"ok": True, "message": "Pause requested — job will stop at next chapter boundary"})
+
+
+@app.route("/jobs/<job_id>/resume", methods=["POST"])
+def resume_job(job_id):
+    """Re-queue a paused job, starting from its saved checkpoint."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] != "paused":
+            return jsonify({"error": f"Cannot resume job in status '{job['status']}'"}), 409
+        checkpoint = job.get("checkpoint") or {}
+        orig_params = dict(job.get("params") or {})
+        # Build resumed params — override from_chapter and start_url from checkpoint
+        if checkpoint.get("last_url"):
+            orig_params["chapter_one_url"] = checkpoint["last_url"]
+            orig_params["start_url"]       = checkpoint["last_url"]
+        if checkpoint.get("from_chapter") is not None:
+            orig_params["from_chapter"] = checkpoint["from_chapter"]
+        # Create a new job for the resume so the old one is kept in history
+        new_job_id = str(uuid.uuid4())[:8]
+        jobs[new_job_id] = {
+            "status":     "queued",
+            "logs":       [],
+            "stats":      {},
+            "started_at": None,
+            "params":     orig_params,
+            "checkpoint": None,
+        }
+        job["status"] = "resumed"   # mark old job as handled
+    with job_queue_lock:
+        job_queue.append((new_job_id, orig_params))
+    return jsonify({"ok": True, "job_id": new_job_id, "resumed_from": job_id})
 
 
 @app.route("/detect", methods=["POST"])

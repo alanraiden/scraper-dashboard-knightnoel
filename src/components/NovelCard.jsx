@@ -7,7 +7,7 @@ import { getNovelChapters } from '../lib/api.js'
 import NovelStatusBadge, { getNovelStatus } from './NovelStatus.jsx'
 import styles from './NovelCard.module.css'
 
-export default function NovelCard({ novel, watchEntry, isWatching, isRunning, onAddWatch, onRemoveWatch, onStartWatch, onStopWatch, onRunOnce, onResetChapter, onUpdateChainUrl, logs, novelCollections = [], onStatusChange }) {
+export default function NovelCard({ novel, watchEntry, isWatching, isRunning, onAddWatch, onRemoveWatch, onStartWatch, onStopWatch, onRunOnce, onResetChapter, onUpdateChainUrl, logs, novelCollections = [], onStatusChange, isQueued, queuePosition, runNext, runNow, jobRunData }) {
   const [expanded,      setExpanded]      = useState(false)
   const [showForm,      setShowForm]      = useState(!watchEntry)
   const [gaps,          setGaps]          = useState(null)
@@ -20,10 +20,14 @@ export default function NovelCard({ novel, watchEntry, isWatching, isRunning, on
   const [editingChain,  setEditingChain]  = useState(false)
   const [chainUrlDraft, setChainUrlDraft] = useState('')
   const [statusId,      setStatusId]      = useState(() => getNovelStatus(novel._id))
+  // Run Now confirmation dialog
+  const [showRunNowConfirm, setShowRunNowConfirm] = useState(false)
 
-  // Last log entry — used for error badge
   const lastLog = logs[logs.length - 1]
   const hasError = lastLog && lastLog.type === 'err' && !isRunning
+  const isStarting = isRunning && !isQueued  // has slot, starting or running
+  // Detect paused state from recent logs
+  const isPaused = !isRunning && !isQueued && logs.some(l => l.msg?.includes('Job paused at') && !logs.some(l2 => l2.ts > l.ts && (l2.msg?.includes('starting') || l2.msg?.includes('Watch check'))))
 
   // Sync form fields from watchEntry every time the edit form opens.
   // Without this, useState keeps the stale value from first render.
@@ -92,6 +96,8 @@ export default function NovelCard({ novel, watchEntry, isWatching, isRunning, on
             {watchEntry && <span className={styles.pill}><Clock size={11}/> checked {lastCheckedLabel}</span>}
             {watchEntry?.lastChapter > 0 && <span className={`${styles.pill} ${styles.pillAccent}`}>last: Ch.{watchEntry.lastChapter}</span>}
             {isRunning && <span className={`${styles.pill} ${styles.pillRunning}`}><RefreshCw size={10} className={styles.spin}/> running…</span>}
+            {isQueued && <span className={`${styles.pill} ${styles.pillQueued}`}>⏳ Queued #{queuePosition}</span>}
+            {isPaused && <span className={`${styles.pill} ${styles.pillPaused}`}>⏸ Paused — resuming soon</span>}
             {hasError && (
               <span className={`${styles.pill} ${styles.pillError}`} title={lastLog.msg}>
                 ✗ last run failed
@@ -128,9 +134,33 @@ export default function NovelCard({ novel, watchEntry, isWatching, isRunning, on
             </button>
           )}
           {watchEntry && (
-            <button className={`${styles.btn} ${styles.btnRefresh}`} title="Check now"
-              onClick={() => onRunOnce(novel._id)} disabled={isRunning}>
+            <button
+              id={`check-now-${novel._id}`}
+              className={`${styles.btn} ${styles.btnRefresh} ${isQueued ? styles.btnQueued : ''}`}
+              title={isQueued ? `Queued at position #${queuePosition} — click to Check Now again` : 'Check now'}
+              onClick={() => onRunOnce(novel._id)}
+              disabled={isRunning}>
               <RefreshCw size={13} className={isRunning ? styles.spin : ''}/>
+            </button>
+          )}
+          {/* Run Next — promote queued novel to front */}
+          {isQueued && queuePosition > 1 && runNext && (
+            <button
+              id={`run-next-${novel._id}`}
+              className={`${styles.btn} ${styles.btnRunNext}`}
+              title="Run Next — move to front of queue"
+              onClick={() => runNext(novel._id)}>
+              ↑
+            </button>
+          )}
+          {/* Run Now — force start immediately */}
+          {watchEntry && !isRunning && runNow && (
+            <button
+              id={`run-now-${novel._id}`}
+              className={`${styles.btn} ${styles.btnRunNow}`}
+              title="Run Now — start immediately (may pause another job)"
+              onClick={() => setShowRunNowConfirm(true)}>
+              ⚡
             </button>
           )}
           {watchEntry && (
@@ -144,6 +174,33 @@ export default function NovelCard({ novel, watchEntry, isWatching, isRunning, on
           </button>
         </div>
       </div>
+
+      {/* ── Run Now confirmation dialog ── */}
+      {showRunNowConfirm && (
+        <div className={styles.confirmOverlay} onClick={() => setShowRunNowConfirm(false)}>
+          <div className={styles.confirmDialog} onClick={e => e.stopPropagation()}>
+            <div className={styles.confirmIcon}>⚡</div>
+            <div className={styles.confirmTitle}>Run Now?</div>
+            <div className={styles.confirmBody}>
+              {Object.keys(jobRunData || {}).length > 0
+                ? <>Another job is currently running.<br/>Running this novel now will <strong>pause</strong> the current job and give this novel priority.<br/><span className={styles.confirmNote}>The paused job will resume automatically once this one finishes.</span></>
+                : <>Start this novel immediately?</>
+              }
+            </div>
+            <div className={styles.confirmActions}>
+              <button
+                id={`confirm-run-now-${novel._id}`}
+                className={styles.confirmRunBtn}
+                onClick={() => { setShowRunNowConfirm(false); runNow(novel._id) }}>
+                ⚡ Run Now
+              </button>
+              <button className={styles.confirmCancelBtn} onClick={() => setShowRunNowConfirm(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Expanded section ── */}
       {expanded && (
