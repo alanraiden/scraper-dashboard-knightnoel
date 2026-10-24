@@ -13,7 +13,7 @@ Requirements:
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import threading, time, re, os, json, uuid
+import threading, time, re, os, json, uuid, random
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -629,15 +629,21 @@ def run_scrape_job(job_id, params):
             return t.strip() or title
 
         if mode == "watch_check":
-            # Query the KN backend for the real highest stored chapter so we never
-            # re-crawl from Ch.1. Overrides whatever from_chapter was passed in.
-            # Gaps (deleted chapters) are handled by the separate gap-detection feature.
+            # Query the KN backend for the real highest stored chapter.
+            # Only advance from_chapter if the API max is HIGHER than what the
+            # frontend already computed.  If the frontend sent a LOWER value it
+            # means gap-detection found deleted / missing chapters and we must
+            # honour that lower start so those chapters get re-scraped.
             api_max = _fetch_max_stored_chapter(api_url, novel_slug, token)
             if api_max > from_chapter:
                 log(f"KN API reports {api_max} chapters stored — starting after Ch.{api_max}", "dim")
-                from_chapter  = api_max
-                index_offset  = api_max   # chain mode: keep index numbering aligned
-            log(f"-- Watch check started (stored up to Ch.{from_chapter}) --", "info")
+                from_chapter = api_max
+                index_offset = api_max   # chain mode: keep index numbering aligned
+            else:
+                if api_max < from_chapter:
+                    log(f"Gap-fill mode: frontend detected missing chapters — scanning from Ch.{from_chapter} (DB max is Ch.{api_max})", "warn")
+                # from_chapter stays as-is (already correct from frontend gap detection)
+            log(f"-- Watch check started (scanning from Ch.{from_chapter}) --", "info")
 
         log(f"Starting forward crawl from: {chapter_one_url}", "info")
         upload_batch = []   # chapters accumulated for bulk upload
@@ -648,7 +654,6 @@ def run_scrape_job(job_id, params):
         url     = chapter_one_url
         index   = index_offset + 1  # chain mode: start index at the right offset so infer_chapter_number fallback is correct
         visited = set()
-        consecutive_skips = 0
         last_real_chapter_url = None  # tracks highest chapter URL for chain mode
 
         while url and stats["scraped"] < max_chapters:
@@ -700,15 +705,23 @@ def run_scrape_job(job_id, params):
                 # genuinely short pages before uploading
                 junk, reason = is_junk_page(content or "", min_words=min_words)
                 if junk:
-                    log(f"Ch.{ch_num} -- {title} skipped: {reason}", "warn")
+                    log(f"Ch.{ch_num} -- {title}: locked/unavailable ({reason}) — stopping here", "warn")
                     stats["skipped"] += 1
-                    consecutive_skips += 1
-                    if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
-                        log(f"-- {consecutive_skips} consecutive locked/empty chapters -- stopping crawl --", "warn")
-                        break
                     push_stats()
+                    # Flush whatever was already batched up to this point
+                    if upload_batch:
+                        created, errs = push_batch(upload_batch)
+                        stats["uploaded"] += created
+                        stats["errors"]   += len(errs)
+                        upload_batch.clear()
+                        push_stats()
+                    # Emit the last good chapter URL so chain/watch mode resumes correctly
+                    if last_real_chapter_url:
+                        log(f"__last_chapter_url__:{last_real_chapter_url}", "dim")
+                    log("-- Stopped at first locked chapter (content unavailable) --", "warn")
+                    break
+
                 else:
-                    consecutive_skips = 0
                     log(f"Ch.{ch_num} -- {title} ({wc}w)", "ok")
                     # Accumulate into batch — flush every BATCH_SIZE or at end
                     upload_batch.append({"number": ch_num, "title": title, "content": content})
@@ -1176,6 +1189,12 @@ class WatchScheduler:
         self._thread.start()
 
     def _loop(self):
+        # After a restart (e.g. power cut), wait before firing watches to avoid
+        # a thundering herd where all stale watches queue simultaneously and
+        # overwhelm the concurrency-limited job queue.
+        print("[Scheduler] Warming up — will start checking watches in 5 minutes...")
+        time.sleep(300)  # 5-minute warmup
+        print("[Scheduler] Warmup complete — now monitoring watches.")
         while True:
             time.sleep(60)
             try:
@@ -1183,26 +1202,59 @@ class WatchScheduler:
             except Exception as e:
                 print(f"[Scheduler] Unhandled error: {e}")
 
+    # Maximum number of watches to trigger in a single tick.
+    # Prevents queue flooding after a restart when many watches are overdue.
+    MAX_TRIGGERS_PER_TICK = 5
+    # Don't queue more watches if the job queue already has this many items.
+    MAX_QUEUE_DEPTH       = 8
+
     def _tick(self):
         now = time.time()
         with _watches_lock:
             watches = _load_watches()
 
+        # Collect all due watches, then shuffle + cap to avoid thundering herd
+        due = []
         for novel_id, w in watches.items():
             if not w.get("active"):
                 continue
             interval_secs = float(w.get("intervalHours", 1)) * 3600
             last_checked  = w.get("lastChecked", 0)
-            # Skip if a job for this novel is already running
+            # Skip if a job for this novel is already running or queued
             already_running = any(
-                j.get("novel_id") == novel_id and j.get("status") in ("pending", "running")
+                j.get("novel_id") == novel_id and j.get("status") in ("pending", "running", "queued", "starting")
                 for j in jobs.values()
             )
             if already_running:
                 continue
             if now - last_checked >= interval_secs:
-                print(f"[Scheduler] Triggering watch for: {w.get('novelTitle', novel_id)}")
-                self._trigger(novel_id, w)
+                due.append((novel_id, w))
+
+        if not due:
+            return
+
+        # Randomise order so we don't always favour the same novels
+        random.shuffle(due)
+
+        triggered = 0
+        for novel_id, w in due:
+            # Queue depth guard — don't pile up if queue is already busy
+            with job_queue_lock:
+                if len(job_queue) >= self.MAX_QUEUE_DEPTH:
+                    print(f"[Scheduler] Queue full ({len(job_queue)} pending) — deferring remaining {len(due) - triggered} watches to next tick")
+                    break
+            # Per-tick cap
+            if triggered >= self.MAX_TRIGGERS_PER_TICK:
+                print(f"[Scheduler] Hit per-tick cap ({self.MAX_TRIGGERS_PER_TICK}) — deferring {len(due) - triggered} watches to next tick")
+                break
+
+            print(f"[Scheduler] Triggering watch for: {w.get('novelTitle', novel_id)}")
+            self._trigger(novel_id, w)
+            triggered += 1
+
+            # Stagger between triggers to spread load
+            if triggered < len(due):
+                time.sleep(random.uniform(3, 10))
 
     def _trigger(self, novel_id, w):
         mode = w.get("mode", "chain")

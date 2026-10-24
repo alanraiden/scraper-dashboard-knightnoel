@@ -91,6 +91,25 @@ _PAYWALL_SIGNALS = [
     r"available\s+in\s+\d+\s+day",
     r"free\s+in\s+\d+\s+(hour|day|minute)",
 
+    # Early access / advance chapter systems
+    r"early\s+access\s+chapter",
+    r"advance\s+chapter",
+    r"patron[s]?\s+only",
+    r"patreon\s+exclusive",
+    r"this\s+chapter\s+is\s+only\s+available",
+    r"read\s+\d+\s+chapters?\s+ahead",
+    r"chapters?\s+ahead\s+on\s+patreon",
+    r"support\s+(the\s+)?(author|translator|tl)\s+on\s+patreon",
+
+    # Coin / gem / point unlock systems
+    r"spend\s+\d+\s+(coins?|gems?|points?|crystals?)\s+to\s+(read|unlock)",
+    r"use\s+\d+\s+(coins?|gems?|points?)\s+to\s+(read|unlock|access)",
+    r"unlock\s+(with|using)\s+(coins?|points?|patreon|gems?|crystals?)",
+    r"you\s+don['\u2019]t\s+have\s+enough\s+(coins?|points?|gems?)",
+    r"buy\s+(coins?|points?|premium)\s+to\s+(read|continue|access)",
+    r"vip\s+(chapter|content|only|access)",
+    r"privileged\s+chapter",
+
     # Login / auth walls
     r"login\s+or\s+create\s+an\s+account",
     r"log\s+in\s+to\s+(read|unlock|access|view)",
@@ -106,9 +125,22 @@ _PAYWALL_SIGNALS = [
     r"members?\s+only",
     r"subscribe\s+to\s+(read|unlock|access)",
     r"patreon\s+subscription",
-    r"unlock\s+(with|using)\s+(coins?|points?|patreon)",
     r"want\s+to\s+read\s+other\s+chapters",
     r"back\s+to\s+novel",
+
+    # Soft continuation teasers — short preview then gate
+    r"to\s+continue\s+reading[,.]?\s+please\s+(subscribe|sign\s+up|log\s+in|join|unlock)",
+    r"continue\s+reading\s+on\s+",
+    r"read\s+the\s+full\s+chapter\s+on\s+",
+    r"this\s+preview\s+has\s+ended",
+    r"end\s+of\s+preview",
+    r"subscribe\s+to\s+(unlock|read|continue|access)\s+(the\s+)?(rest|full|complete)",
+    r"\[chapter\s+locked\]",
+    r"\[locked\]",
+
+    # Pending / scheduled availability
+    r"this\s+chapter\s+will\s+be\s+available",
+    r"chapter\s+scheduled\s+for\s+(release|publication)",
 
     # Reading-settings / UI chrome pages
     r"customize\s+reading\s+experience",
@@ -132,6 +164,7 @@ _PAYWALL_SIGNALS = [
     r"manual\s+entry\s+or\s+bulk\s+import",
     r"MONGODB_URI\s+is\s+configured",
 ]
+
 
 _compiled_paywall = [re.compile(p, re.I) for p in _PAYWALL_SIGNALS]
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=Knight Novel Scraper Bot (monitor + auto-recovery)
+After=network.target scraper.service
+Wants=scraper.service
+
+[Service]
+Type=simple
+User=iden
+WorkingDirectory=/home/iden/scraper-dashboard-knightnoel/scraper-server
+# Wait 30s after boot so the scraper server can fully initialise
+ExecStartPre=/bin/sleep 30
+ExecStart=/home/iden/scraper-dashboard-knightnoel/scraper-server/venv/bin/python3 scraper_bot.py
+Restart=always
+RestartSec=30
+# Bot is lightweight — cap memory
+MemoryMax=128M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

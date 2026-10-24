@@ -196,6 +196,7 @@ export function useWatcher(addLog) {
     // If it's missing (legacy entry saved before novelSlug was stored), fetch
     // it directly from the KN novels API and backfill it in localStorage.
     let storedLast = entry.lastChapter || 0
+    let gapDetected = false   // set to true when deleted chapters are found
     let novelSlug = entry.novelSlug || ''
     if (!novelSlug) {
       try {
@@ -228,6 +229,7 @@ export function useWatcher(addLog) {
           if (lowestGap !== null) {
             // Start from just before the gap so the scraper picks it up
             storedLast = lowestGap - 1
+            gapDetected = true
             addLog(novelId, `Gap detected — missing from Ch.${lowestGap} (scanning from Ch.${storedLast})`, 'warn')
           } else {
             storedLast = maxNum
@@ -249,14 +251,17 @@ export function useWatcher(addLog) {
       const apiUrl = localStorage.getItem('kn_api_url') || localStorage.getItem('ns_api_url') || ''
       const token  = localStorage.getItem('kn_scraper_key') || localStorage.getItem('ns_token')   || ''
 
-      const crawlStartUrl = entry.mode === 'chain'
+      // In chain mode with a gap (deleted chapters), rewind to chapterOneUrl so
+      // the crawler walks forward from Ch.1 and fills the missing chapters.
+      // Without a gap, chain mode resumes from the last known chapter URL as usual.
+      const crawlStartUrl = (entry.mode === 'chain' && !gapDetected)
         ? (entry.lastChapterUrl || entry.startUrl)
         : (entry.chapterOneUrl || entry.startUrl)
       let jobId
       try {
         jobId = await startJob({
           mode:             'watch_check',
-          start_url:        entry.mode === 'chain' ? crawlStartUrl : entry.startUrl,
+          start_url:        entry.mode === 'chain' && !gapDetected ? crawlStartUrl : entry.startUrl,
           chapter_one_url:  crawlStartUrl,
           novel_id:         novelId,
           novel_slug:       novelSlug,

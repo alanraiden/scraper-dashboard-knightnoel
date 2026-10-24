@@ -1,0 +1,29 @@
+{
+  "scraper_url": "http://localhost:7832",
+  "kn_api_url": "http://localhost:3000",
+  "kn_api_key": "skpr_7f4a2b9e1c6d3f8a5b0e7d4c2a9f6e3b1d8c5a2",
+
+  "tick_interval_seconds": 60,
+  "staleness_check_interval_minutes": 30,
+  "staleness_threshold_multiplier": 2.0,
+
+  "recovery": {
+    "enabled": true,
+    "batch_size": 3,
+    "batch_gap_minutes": 10,
+    "restart_uptime_threshold_seconds": 600
+  },
+
+  "auto_retry": {
+    "enabled": true,
+    "max_retries_per_day": 3,
+    "retry_delay_minutes": 15
+  },
+
+  "notifications": {
+    "discord_webhook_url": "",
+    "daily_digest_hour": 9
+  },
+
+  "log_dir": "bot_logs"
+}
