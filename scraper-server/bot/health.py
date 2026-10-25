@@ -139,21 +139,62 @@ def get_all_jobs():
     return None
 
 
+def is_watch_already_queued(novel_id, novel_slug=None):
+    """
+    Check if a watch already has a job running or queued in the scraper server.
+    This prevents the bot from trying to trigger watches the scheduler already handles.
+
+    The queue stores novel_slug (e.g. 'the-failed-swordmaster') while watches
+    are keyed by novel_id (MongoDB ObjectId). We check both.
+    """
+    identifiers = {novel_id}
+    if novel_slug:
+        identifiers.add(novel_slug)
+
+    # Check the queue endpoint first (cheaper)
+    queue = get_queue_status()
+    if queue:
+        for item in queue.get("queue", []):
+            if item.get("novel") in identifiers:
+                return True, f"already queued ({item.get('novel')})"
+
+    # Check running jobs
+    all_jobs = get_all_jobs()
+    if all_jobs and isinstance(all_jobs, dict):
+        for job_id, job_data in all_jobs.items():
+            job_ids = set()
+            if job_data.get("novel_slug"):
+                job_ids.add(job_data["novel_slug"])
+            if job_data.get("novel_id"):
+                job_ids.add(job_data["novel_id"])
+            status = job_data.get("status", "")
+            if identifiers & job_ids and status in ("running", "starting", "queued", "pending"):
+                return True, f"job {job_id} is {status}"
+
+    return False, None
+
+
 def trigger_watch(novel_id):
-    """Trigger an immediate watch check. Returns job_id or None."""
+    """
+    Trigger an immediate watch check.
+    Returns (job_id_or_None, error_reason_or_None).
+    """
     cfg = get_config()
     url = f"{cfg['scraper_url'].rstrip('/')}/watches/{novel_id}/run"
     try:
         r = requests.post(url, timeout=15)
         if r.ok:
             data = r.json()
-            return data.get("job_id")
+            return data.get("job_id"), None
         else:
-            data = r.json()
-            logger.warn(f"Failed to trigger watch {novel_id}: {data.get('error', f'HTTP {r.status_code}')}")
+            try:
+                data = r.json()
+                reason = data.get("error", f"HTTP {r.status_code}")
+            except Exception:
+                reason = f"HTTP {r.status_code}"
+            return None, reason
     except Exception as e:
-        logger.error(f"Error triggering watch {novel_id}: {e}")
-    return None
+        return None, str(e)
 
 
 def patch_watch(novel_id, updates):

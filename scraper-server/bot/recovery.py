@@ -18,7 +18,7 @@ from bot.config import get_config
 from bot import logger, health, state
 from bot.staleness import (
     DIAG_OVERDUE, DIAG_CHAIN_URL_DEAD, DIAG_SITE_BLOCKED,
-    DIAG_SITE_DOWN, DIAG_KN_DRIFT, DIAG_UNKNOWN,
+    DIAG_SITE_DOWN, DIAG_KN_DRIFT, DIAG_ALREADY_QUEUED, DIAG_UNKNOWN,
 )
 
 HEADERS = {
@@ -66,6 +66,12 @@ def recover_watch(diagnosed_entry):
     if not can_retry(novel_id):
         return {"action": "skip", "success": False, "message": "Retry budget exhausted for today"}
 
+    # ── Already queued — scheduler is handling it, don't interfere ─────────
+    if diag == DIAG_ALREADY_QUEUED:
+        queue_reason = details.get("queue_reason", "unknown")
+        logger.debug(f"[{title}] Already in scraper queue ({queue_reason}) — skipping", novel_id=novel_id)
+        return {"action": "skip", "success": False, "message": f"Already queued: {queue_reason}"}
+
     # ── Site blocked / down — can't do anything automated ─────────────────
     if diag == DIAG_SITE_BLOCKED:
         logger.warn(f"[{title}] Site is blocking us (403) — cannot auto-recover", novel_id=novel_id)
@@ -84,7 +90,7 @@ def recover_watch(diagnosed_entry):
             if success:
                 state.add_daily_stat("drift_fixes")
                 # Now trigger a fresh check
-                return _trigger_and_track(novel_id, title, "drift_fix")
+                return _trigger_and_track(novel_id, slug, title, "drift_fix")
             else:
                 return {"action": "error", "success": False, "message": f"Failed to patch watch state for {title}"}
 
@@ -97,7 +103,7 @@ def recover_watch(diagnosed_entry):
             success = health.patch_watch(novel_id, {"lastChapterUrl": new_url})
             if success:
                 state.add_daily_stat("chain_repairs")
-                return _trigger_and_track(novel_id, title, "chain_repair")
+                return _trigger_and_track(novel_id, slug, title, "chain_repair")
             else:
                 return {"action": "error", "success": False, "message": f"Failed to update chain URL for {title}"}
         else:
@@ -106,25 +112,33 @@ def recover_watch(diagnosed_entry):
 
     # ── Simple overdue — just re-trigger ──────────────────────────────────
     if diag == DIAG_OVERDUE:
-        return _trigger_and_track(novel_id, title, "retry")
+        return _trigger_and_track(novel_id, slug, title, "retry")
 
     # ── Unknown — try a simple re-trigger ─────────────────────────────────
     logger.warn(f"[{title}] Unknown diagnosis — attempting simple re-trigger", novel_id=novel_id)
-    return _trigger_and_track(novel_id, title, "retry_unknown")
+    return _trigger_and_track(novel_id, slug, title, "retry_unknown")
 
 
-def _trigger_and_track(novel_id, title, action_type):
+def _trigger_and_track(novel_id, novel_slug, title, action_type):
     """Trigger a watch and track the retry."""
+    # Double-check queue before triggering — avoids wasting retries
+    already_queued, queue_reason = health.is_watch_already_queued(
+        novel_id, novel_slug=novel_slug
+    )
+    if already_queued:
+        logger.debug(f"[{title}] Already in scraper queue ({queue_reason}) — not re-triggering", novel_id=novel_id)
+        return {"action": "skip", "success": False, "message": f"Already queued: {queue_reason}"}
+
     retry_num = state.increment_retry(novel_id)
     state.add_daily_stat("retries_triggered")
 
-    job_id = health.trigger_watch(novel_id)
+    job_id, error_reason = health.trigger_watch(novel_id)
     if job_id:
         logger.info(f"[{title}] Triggered watch check (retry #{retry_num}) → job {job_id}", novel_id=novel_id)
         return {"action": action_type, "success": True, "message": f"Triggered for {title}", "job_id": job_id}
     else:
-        logger.error(f"[{title}] Failed to trigger watch check", novel_id=novel_id)
-        return {"action": "error", "success": False, "message": f"Trigger failed for {title}"}
+        logger.warn(f"[{title}] Failed to trigger: {error_reason}", novel_id=novel_id)
+        return {"action": "error", "success": False, "message": f"Trigger failed for {title}: {error_reason}"}
 
 
 def _repair_chain_url(watch):

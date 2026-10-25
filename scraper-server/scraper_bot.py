@@ -45,6 +45,10 @@ _kn_was_down          = False
 _stuck_job_tracker    = {}
 STUCK_JOB_THRESHOLD   = 30 * 60  # 30 minutes
 
+# Alert deduplication: set of novel_ids we already alerted about this session.
+# Cleared when a watch recovers (becomes non-stale).
+_alerted_stale_ids    = set()
+
 
 def _signal_handler(sig, frame):
     global _running
@@ -162,6 +166,7 @@ def _tick(cfg, tick_number):
 
 def _run_staleness_check(cfg):
     """Full staleness check with diagnosis and auto-recovery."""
+    global _alerted_stale_ids
     logger.info("Running staleness check...")
 
     watches = health.get_watches()
@@ -171,47 +176,82 @@ def _run_staleness_check(cfg):
 
     stale = find_stale_watches(watches)
     if not stale:
-        logger.info(f"All {len([w for w in watches if w.get('active')])} active watches are up-to-date")
+        active_count = len([w for w in watches if w.get('active')])
+        logger.info(f"All {active_count} active watches are up-to-date")
+        # Clear dedup set — everything recovered
+        if _alerted_stale_ids:
+            _alerted_stale_ids.clear()
         return
 
-    logger.warn(f"Found {len(stale)} stale watch(es) — running diagnostics...")
-
-    # Diagnose each stale watch
+    # Diagnose each stale watch (includes queue check)
     diagnosed = diagnose_all(stale)
 
-    # Log the report
+    # Separate already-queued from truly needing attention
+    from bot.staleness import DIAG_ALREADY_QUEUED
+    queued_count = sum(1 for e in diagnosed if e.get('diagnosis') == DIAG_ALREADY_QUEUED)
+    truly_stale  = [e for e in diagnosed if e.get('diagnosis') != DIAG_ALREADY_QUEUED]
+
+    if queued_count > 0:
+        logger.info(f"{queued_count} stale watch(es) already queued in scraper — scheduler is handling them")
+
+    if not truly_stale:
+        logger.info(f"All {len(stale)} stale watches are already queued/running — no action needed")
+        return
+
+    logger.warn(f"{len(truly_stale)} watch(es) need attention (plus {queued_count} already queued)")
+
+    # Log the report (only truly stale)
     report = format_staleness_report(diagnosed)
     for line in report.split("\n"):
-        logger.info(line)
+        if line.strip():
+            logger.info(line)
 
-    # Send Discord alert if there are new stale watches
-    notifications.notify_stale_watches(diagnosed)
+    # Only send Discord alerts for NEWLY stale watches (not already alerted)
+    new_stale = [e for e in truly_stale if e["novel_id"] not in _alerted_stale_ids]
+    if new_stale:
+        notifications.notify_stale_watches(new_stale)
+        for e in new_stale:
+            _alerted_stale_ids.add(e["novel_id"])
+    else:
+        logger.debug(f"No new stale watches to alert about ({len(truly_stale)} already reported)")
 
-    # Auto-recover where possible
-    if cfg["auto_retry"]["enabled"]:
-        logger.info("Attempting auto-recovery for recoverable watches...")
-        for entry in diagnosed:
-            try:
-                result = recover_watch(entry)
-                if result.get("success"):
-                    notifications.notify_auto_recovery(
-                        entry["novel_title"],
-                        result["action"],
-                        True,
-                        result.get("message", ""),
-                    )
-                elif result.get("action") == "alert":
-                    notifications.notify_auto_recovery(
-                        entry["novel_title"],
-                        result["action"],
-                        False,
-                        result.get("message", ""),
-                    )
-            except Exception as e:
-                logger.error(f"Recovery failed for {entry.get('novel_title')}: {e}")
+    # Clear dedup entries for watches that are no longer stale
+    current_stale_ids = {e["novel_id"] for e in truly_stale}
+    recovered = _alerted_stale_ids - current_stale_ids
+    if recovered:
+        logger.info(f"{len(recovered)} previously stale watch(es) have recovered")
+        _alerted_stale_ids -= recovered
 
-            # Small delay between recovery attempts
-            time.sleep(3)
+    # Auto-recover truly stale watches only
+    if cfg["auto_retry"]["enabled"] and truly_stale:
+        recoverable = [e for e in truly_stale if e.get('diagnosis') != DIAG_ALREADY_QUEUED]
+        if recoverable:
+            logger.info(f"Attempting auto-recovery for {len(recoverable)} watch(es)...")
+            for entry in recoverable:
+                try:
+                    result = recover_watch(entry)
+                    if result.get("success"):
+                        notifications.notify_auto_recovery(
+                            entry["novel_title"],
+                            result["action"],
+                            True,
+                            result.get("message", ""),
+                        )
+                    elif result.get("action") == "alert":
+                        notifications.notify_auto_recovery(
+                            entry["novel_title"],
+                            result["action"],
+                            False,
+                            result.get("message", ""),
+                        )
+                    elif result.get("action") == "skip":
+                        # Silently skip (budget exhausted, already queued, etc.)
+                        pass
+                except Exception as e:
+                    logger.error(f"Recovery failed for {entry.get('novel_title')}: {e}")
+
+                # Small delay between recovery attempts
+                time.sleep(3)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

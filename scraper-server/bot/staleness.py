@@ -3,6 +3,9 @@ bot/staleness.py — Detect stale watches and diagnose why they stopped updating
 
 A watch is "stale" when lastChecked is older than (threshold_multiplier × intervalHours).
 For each stale watch, we run diagnostics to determine the likely root cause.
+
+Key improvement: watches that already have a job running/queued in the scraper are
+NOT reported as stale — they're already being handled by the WatchScheduler.
 """
 
 import time
@@ -19,6 +22,7 @@ DIAG_SITE_BLOCKED    = "site_blocked"      # Source site returning 403
 DIAG_SITE_DOWN       = "site_down"         # Source site unreachable
 DIAG_KN_DRIFT        = "kn_drift"          # KN chapter count doesn't match watch
 DIAG_WATCH_INACTIVE  = "watch_inactive"    # Watch is not active
+DIAG_ALREADY_QUEUED  = "already_queued"    # Job already queued/running — scheduler is handling it
 DIAG_UNKNOWN         = "unknown"           # Could not determine cause
 
 
@@ -95,6 +99,18 @@ def diagnose_stale_watch(stale_entry):
     diagnosis = DIAG_OVERDUE
     details   = {}
 
+    # 0. First check: is a job already running/queued for this novel?
+    #    If so, the WatchScheduler is already handling it — don't interfere.
+    already_queued, queue_reason = health.is_watch_already_queued(
+        novel_id, novel_slug=slug
+    )
+    if already_queued:
+        diagnosis = DIAG_ALREADY_QUEUED
+        details["queue_reason"] = queue_reason
+        stale_entry["diagnosis"] = diagnosis
+        stale_entry["details"]   = details
+        return stale_entry
+
     # 1. Check if chain URL is dead (chain mode only)
     if mode == "chain":
         chain_url = w.get("lastChapterUrl", "")
@@ -168,44 +184,54 @@ def format_staleness_report(diagnosed_list):
     if not diagnosed_list:
         return "✅ All watches are up-to-date."
 
-    lines = [f"⚠ {len(diagnosed_list)} stale watcher(s) detected:\n"]
+    # Separate already-queued from truly stale
+    queued  = [e for e in diagnosed_list if e.get("diagnosis") == DIAG_ALREADY_QUEUED]
+    truly_stale = [e for e in diagnosed_list if e.get("diagnosis") != DIAG_ALREADY_QUEUED]
 
-    diag_icons = {
-        DIAG_OVERDUE:        "🕐",
-        DIAG_CHAIN_URL_DEAD: "🔗",
-        DIAG_SITE_BLOCKED:   "🚫",
-        DIAG_SITE_DOWN:      "💀",
-        DIAG_KN_DRIFT:       "📊",
-        DIAG_UNKNOWN:        "❓",
-    }
+    lines = []
 
-    diag_labels = {
-        DIAG_OVERDUE:        "Overdue (just needs re-trigger)",
-        DIAG_CHAIN_URL_DEAD: "Chain URL dead (404)",
-        DIAG_SITE_BLOCKED:   "Site blocked (403)",
-        DIAG_SITE_DOWN:      "Site unreachable",
-        DIAG_KN_DRIFT:       "KN chapter count drift",
-        DIAG_UNKNOWN:        "Unknown cause",
-    }
+    if truly_stale:
+        lines.append(f"⚠ {len(truly_stale)} stale watcher(s) need attention:\n")
 
-    for entry in diagnosed_list:
-        diag  = entry.get("diagnosis", DIAG_UNKNOWN)
-        icon  = diag_icons.get(diag, "❓")
-        label = diag_labels.get(diag, "Unknown")
-        title = entry.get("novel_title", entry.get("novel_id", "?"))
-        hrs   = entry.get("hours_overdue", "?")
-        ch    = entry.get("last_chapter", "?")
+        diag_icons = {
+            DIAG_OVERDUE:        "🕐",
+            DIAG_CHAIN_URL_DEAD: "🔗",
+            DIAG_SITE_BLOCKED:   "🚫",
+            DIAG_SITE_DOWN:      "💀",
+            DIAG_KN_DRIFT:       "📊",
+            DIAG_UNKNOWN:        "❓",
+        }
 
-        line = f"  {icon} {title} — Ch.{ch}, {hrs}h overdue"
-        if diag != DIAG_OVERDUE:
-            line += f" [{label}]"
-        lines.append(line)
+        diag_labels = {
+            DIAG_OVERDUE:        "Overdue (just needs re-trigger)",
+            DIAG_CHAIN_URL_DEAD: "Chain URL dead (404)",
+            DIAG_SITE_BLOCKED:   "Site blocked (403)",
+            DIAG_SITE_DOWN:      "Site unreachable",
+            DIAG_KN_DRIFT:       "KN chapter count drift",
+            DIAG_UNKNOWN:        "Unknown cause",
+        }
 
-        # Add detail hints
-        details = entry.get("details", {})
-        if details.get("drift"):
-            lines.append(f"      ↳ KN has Ch.{details['kn_chapter_count']} but watch thinks Ch.{details['watch_last_chapter']}")
-        if details.get("chain_url"):
-            lines.append(f"      ↳ Dead URL: {details['chain_url']}")
+        for entry in truly_stale:
+            diag  = entry.get("diagnosis", DIAG_UNKNOWN)
+            icon  = diag_icons.get(diag, "❓")
+            label = diag_labels.get(diag, "Unknown")
+            title = entry.get("novel_title", entry.get("novel_id", "?"))
+            hrs   = entry.get("hours_overdue", "?")
+            ch    = entry.get("last_chapter", "?")
+
+            line = f"  {icon} {title} — Ch.{ch}, {hrs}h overdue"
+            if diag != DIAG_OVERDUE:
+                line += f" [{label}]"
+            lines.append(line)
+
+            # Add detail hints
+            details = entry.get("details", {})
+            if details.get("drift"):
+                lines.append(f"      ↳ KN has Ch.{details['kn_chapter_count']} but watch thinks Ch.{details['watch_last_chapter']}")
+            if details.get("chain_url"):
+                lines.append(f"      ↳ Dead URL: {details['chain_url']}")
+
+    if queued:
+        lines.append(f"\n✅ {len(queued)} watch(es) are stale but already queued/running in scraper — waiting for them to finish")
 
     return "\n".join(lines)
