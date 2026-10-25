@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-scraper_bot.py — Knight Novel Scraper Management Bot
-=====================================================
+scraper_bot.py — Knight Novel Scraper Management Bot v3
+=======================================================
 A standalone daemon that monitors the scraper server, detects stale watches,
 auto-recovers failed scraping jobs, repairs chain URLs, and sends Discord
 notifications.
+
+v3 improvements:
+  - Auto-cancel stuck jobs after 30 min + pause watch after 3 timeouts
+  - Dead man's switch via healthchecks.io
+  - Internet connectivity check before recovery
+  - Proper error logging for trigger failures
+  - Alert deduplication (no repeat Discord spam)
 
 Run alongside the scraper server on the same machine:
     python scraper_bot.py
@@ -22,6 +29,7 @@ import os
 import time
 import signal
 import traceback
+import requests
 
 # Ensure the bot package is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,12 +46,15 @@ from bot.reporter import generate_daily_report, should_send_digest, mark_digest_
 
 _running = True
 _last_staleness_check = 0
+_last_heartbeat       = 0
 _scraper_was_down     = False
 _kn_was_down          = False
 
-# Stuck job tracking: job_id → first_seen_timestamp
+# Stuck job tracking: job_id → {"first_seen": timestamp, "novel_slug": str, "novel_id": str, "alerted": bool}
 _stuck_job_tracker    = {}
-STUCK_JOB_THRESHOLD   = 30 * 60  # 30 minutes
+STUCK_JOB_THRESHOLD   = 30 * 60   # 30 minutes — alert
+AUTO_CANCEL_THRESHOLD = 35 * 60   # 35 minutes — auto-cancel (5 min grace after alert)
+MAX_TIMEOUTS_BEFORE_PAUSE = 3     # Pause watch after 3 timeouts
 
 # Alert deduplication: set of novel_ids we already alerted about this session.
 # Cleared when a watch recovers (becomes non-stale).
@@ -61,6 +72,31 @@ signal.signal(signal.SIGTERM, _signal_handler)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  DEAD MAN'S SWITCH (healthchecks.io)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _ping_heartbeat():
+    """Ping healthchecks.io to confirm the bot is alive.
+    If this stops, healthchecks.io alerts you from OUTSIDE the server."""
+    global _last_heartbeat
+    cfg = get_config()
+    hc_url = cfg.get("healthcheck_url", "")
+    if not hc_url:
+        return
+
+    now = time.time()
+    interval = cfg.get("healthcheck_interval_seconds", 300)  # default 5 min
+    if now - _last_heartbeat < interval:
+        return
+
+    try:
+        requests.get(hc_url, timeout=10)
+        _last_heartbeat = now
+    except Exception as e:
+        logger.warn(f"Healthcheck ping failed: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -69,13 +105,15 @@ def main():
 
     cfg = load_config()
     logger.info("=" * 56)
-    logger.info("  Knight Novel Scraper Bot starting...")
+    logger.info("  Knight Novel Scraper Bot v3 starting...")
     logger.info("=" * 56)
     logger.info(f"  Scraper server: {cfg['scraper_url']}")
     logger.info(f"  KN API:         {cfg['kn_api_url']}")
     logger.info(f"  Discord:        {'configured' if notifications.is_configured() else 'not configured'}")
+    logger.info(f"  Heartbeat:      {'configured' if cfg.get('healthcheck_url') else 'not configured'}")
     logger.info(f"  Tick interval:  {cfg['tick_interval_seconds']}s")
     logger.info(f"  Auto-retry:     {'enabled' if cfg['auto_retry']['enabled'] else 'disabled'}")
+    logger.info(f"  Auto-cancel:    stuck jobs after {AUTO_CANCEL_THRESHOLD // 60} min")
     logger.info("=" * 56)
 
     # Record startup and check if this is a crash recovery scenario
@@ -104,6 +142,9 @@ def main():
 def _tick(cfg, tick_number):
     """One iteration of the main loop."""
     global _last_staleness_check, _scraper_was_down, _kn_was_down
+
+    # ── 0. Dead man's switch ping ─────────────────────────────────────────
+    _ping_heartbeat()
 
     # ── 1. Health checks (every tick) ─────────────────────────────────────
 
@@ -141,7 +182,7 @@ def _tick(cfg, tick_number):
             notifications.notify_server_recovered("Knight Novel API")
             _kn_was_down = False
 
-    # ── 2. Stuck job detection (every tick) ───────────────────────────────
+    # ── 2. Stuck job detection + auto-cancel (every tick) ─────────────────
 
     _check_stuck_jobs()
 
@@ -226,6 +267,11 @@ def _run_staleness_check(cfg):
     if cfg["auto_retry"]["enabled"] and truly_stale:
         recoverable = [e for e in truly_stale if e.get('diagnosis') != DIAG_ALREADY_QUEUED]
         if recoverable:
+            # Internet check before recovery — avoid false 403s when router is still booting
+            if not health.check_internet():
+                logger.warn("No internet connectivity — deferring recovery until connection is restored")
+                return
+
             logger.info(f"Attempting auto-recovery for {len(recoverable)} watch(es)...")
             for entry in recoverable:
                 try:
@@ -287,6 +333,18 @@ def _check_crash_recovery(cfg):
 
     logger.info("Scraper server is up — checking for stale watches...")
 
+    # ── Internet connectivity check ──────────────────────────────────────
+    # After a power cut, the router often comes back 1-3 min after the server.
+    if not health.check_internet():
+        logger.warn("Server is up but no internet — waiting for router...")
+        for attempt in range(12):  # Try for up to 2 more minutes
+            time.sleep(10)
+            if health.check_internet():
+                logger.info("Internet is back!")
+                break
+        else:
+            logger.error("No internet after 2 minutes — proceeding anyway (may get false 403s)")
+
     # Give the server a moment to fully initialize
     time.sleep(5)
 
@@ -312,9 +370,10 @@ def _check_crash_recovery(cfg):
         diagnosed = diagnose_all(stale)
         report = format_staleness_report(diagnosed)
         for line in report.split("\n"):
-            logger.info(line)
+            if line.strip():
+                logger.info(line)
 
-        # Staggered recovery
+        # Staggered recovery (fully automated — no user intervention needed)
         summary = run_power_recovery(diagnosed)
         notifications.notify_power_recovery_complete(summary)
     else:
@@ -325,11 +384,14 @@ def _check_crash_recovery(cfg):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STUCK JOB DETECTION
+#  STUCK JOB DETECTION + AUTO-CANCEL
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _check_stuck_jobs():
-    """Detect jobs that have been running for too long."""
+    """
+    Detect jobs running too long, auto-cancel them, and track timeouts per novel.
+    After 3 timeouts for the same novel, pause its watch and alert once.
+    """
     global _stuck_job_tracker
 
     all_jobs = health.get_all_jobs()
@@ -339,7 +401,7 @@ def _check_stuck_jobs():
     now = time.time()
     active_ids = set()
 
-    # all_jobs may be a dict of {job_id: job_data} or similar
+    # all_jobs is a dict of {job_id: job_data}
     items = all_jobs.items() if isinstance(all_jobs, dict) else []
 
     for job_id, job_data in items:
@@ -353,15 +415,54 @@ def _check_stuck_jobs():
             continue
 
         running_secs = now - started_at
+        novel_slug = job_data.get("novel_slug", job_data.get("novel_id", "unknown"))
+        novel_id   = job_data.get("novel_id", novel_slug)
 
-        if running_secs >= STUCK_JOB_THRESHOLD:
-            if job_id not in _stuck_job_tracker:
-                _stuck_job_tracker[job_id] = now
-                novel_slug = job_data.get("novel_slug", job_data.get("novel_id", "unknown"))
+        # ── Phase 1: Alert at 30 min ────────────────────────────────────
+        if running_secs >= STUCK_JOB_THRESHOLD and job_id not in _stuck_job_tracker:
+            _stuck_job_tracker[job_id] = {
+                "first_seen": now,
+                "novel_slug": novel_slug,
+                "novel_id":   novel_id,
+                "alerted":    True,
+                "cancelled":  False,
+            }
+            running_mins = running_secs / 60
+            logger.warn(f"Stuck job detected: {job_id} ({novel_slug}) running for {running_mins:.0f} min — will auto-cancel in 5 min")
+            notifications.notify_stuck_job(job_id, novel_slug, running_mins)
+            state.add_daily_stat("stuck_jobs_detected")
+
+        # ── Phase 2: Auto-cancel at 35 min ──────────────────────────────
+        if running_secs >= AUTO_CANCEL_THRESHOLD and job_id in _stuck_job_tracker:
+            tracker = _stuck_job_tracker[job_id]
+            if not tracker.get("cancelled"):
+                tracker["cancelled"] = True
                 running_mins = running_secs / 60
-                logger.warn(f"Stuck job detected: {job_id} ({novel_slug}) running for {running_mins:.0f} min")
-                notifications.notify_stuck_job(job_id, novel_slug, running_mins)
-                state.add_daily_stat("stuck_jobs_detected")
+                logger.warn(f"Auto-cancelling stuck job {job_id} ({novel_slug}) after {running_mins:.0f} min")
+
+                success = health.cancel_job(job_id)
+                if success:
+                    logger.info(f"Job {job_id} cancelled successfully")
+                    state.add_daily_stat("jobs_auto_cancelled")
+
+                    # Track timeouts for this novel
+                    timeout_count = state.increment_timeout(novel_id)
+                    logger.info(f"[{novel_slug}] Timeout #{timeout_count} of {MAX_TIMEOUTS_BEFORE_PAUSE}")
+
+                    # ── Phase 3: Pause watch after 3 timeouts ───────────
+                    if timeout_count >= MAX_TIMEOUTS_BEFORE_PAUSE:
+                        logger.warn(f"[{novel_slug}] Timed out {timeout_count}× — pausing watch (possible pagination loop?)")
+                        health.patch_watch(novel_id, {"active": False})
+                        state.add_paused_watch(novel_id, novel_slug, f"Auto-paused: timed out {timeout_count}× — check for pagination loop or site changes")
+                        state.add_daily_stat("watches_auto_paused")
+                        notifications.notify_watch_paused(
+                            novel_slug,
+                            f"Timed out {timeout_count} times. Paused to prevent resource waste. "
+                            f"Possible causes: pagination loop, site layout changed, or Cloudflare blocking.\n"
+                            f"Check manually and re-enable from the dashboard."
+                        )
+                else:
+                    logger.error(f"Failed to cancel job {job_id}")
 
     # Clean up tracker for jobs that are no longer active
     _stuck_job_tracker = {k: v for k, v in _stuck_job_tracker.items() if k in active_ids}

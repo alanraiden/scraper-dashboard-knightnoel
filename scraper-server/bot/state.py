@@ -153,3 +153,67 @@ def get_daily_stats():
         if daily.get("_date") != today:
             return {"_date": today}
         return dict(daily)
+
+
+# ── Stuck job / timeout tracking ─────────────────────────────────────────────
+
+def increment_timeout(novel_id):
+    """Increment timeout count for a novel. Returns new count."""
+    with _lock:
+        state = _load()
+        timeouts = state.setdefault("timeouts", {})
+        entry = timeouts.get(novel_id, {"count": 0})
+        entry["count"] = entry.get("count", 0) + 1
+        entry["last_timeout"] = time.time()
+        timeouts[novel_id] = entry
+        _save(state)
+        return entry["count"]
+
+
+def get_timeout_count(novel_id):
+    with _lock:
+        state = _load()
+        return state.get("timeouts", {}).get(novel_id, {}).get("count", 0)
+
+
+def reset_timeout(novel_id):
+    with _lock:
+        state = _load()
+        timeouts = state.get("timeouts", {})
+        timeouts.pop(novel_id, None)
+        _save(state)
+
+
+def get_all_timeouts():
+    """Get all novels with timeout counts (for daily report)."""
+    with _lock:
+        return dict(_load().get("timeouts", {}))
+
+
+# ── Bot-paused watches tracking ──────────────────────────────────────────────
+
+def add_paused_watch(novel_id, novel_title, reason):
+    """Record that the bot paused a watch (for daily report)."""
+    with _lock:
+        state = _load()
+        paused = state.setdefault("bot_paused", {})
+        paused[novel_id] = {
+            "title": novel_title,
+            "reason": reason,
+            "paused_at": time.time(),
+        }
+        _save(state)
+
+
+def get_paused_watches():
+    """Get all watches paused by the bot."""
+    with _lock:
+        return dict(_load().get("bot_paused", {}))
+
+
+def remove_paused_watch(novel_id):
+    with _lock:
+        state = _load()
+        state.get("bot_paused", {}).pop(novel_id, None)
+        _save(state)
+

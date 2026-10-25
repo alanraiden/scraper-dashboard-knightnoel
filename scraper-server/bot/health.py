@@ -244,3 +244,62 @@ def check_source_url(url):
         return None, False, "Connection refused"
     except Exception as e:
         return None, False, str(e)
+
+
+def cancel_job(job_id):
+    """Cancel a running or queued job. Returns True if successful."""
+    cfg = get_config()
+    url = f"{cfg['scraper_url'].rstrip('/')}/jobs/{job_id}"
+    try:
+        r = requests.delete(url, timeout=10)
+        return r.ok
+    except Exception as e:
+        logger.error(f"Error cancelling job {job_id}: {e}")
+        return False
+
+
+def get_concurrency():
+    """Get current concurrency config from the scraper server."""
+    cfg = get_config()
+    url = f"{cfg['scraper_url'].rstrip('/')}/config"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def set_concurrency(concurrency):
+    """Update the scraper server's concurrency limit. Returns True if successful."""
+    cfg = get_config()
+    url = f"{cfg['scraper_url'].rstrip('/')}/config"
+    try:
+        r = requests.patch(url, json={"concurrency": concurrency}, timeout=10)
+        return r.ok
+    except Exception as e:
+        logger.error(f"Error setting concurrency to {concurrency}: {e}")
+        return False
+
+
+def check_internet():
+    """
+    Quick connectivity check. Returns True if the server has internet access.
+    Used before recovery to avoid misdiagnosing sites as 'blocked' when
+    the router hasn't come back yet after a power cut.
+    """
+    test_urls = [
+        "https://1.1.1.1",
+        "https://dns.google",
+        "https://www.google.com",
+    ]
+    for url in test_urls:
+        try:
+            r = requests.head(url, timeout=5)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            continue
+    return False
+

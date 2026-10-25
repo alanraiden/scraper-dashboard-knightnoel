@@ -1426,19 +1426,19 @@ def run_watch_now(novel_id):
     if novel_id not in watches:
         return jsonify({"error": "Watch not found"}), 404
 
-    # Refuse if already running
+    # Refuse if already running or queued
     already = any(
-        j.get("novel_id") == novel_id and j.get("status") in ("pending", "running")
+        j.get("novel_id") == novel_id and j.get("status") in ("pending", "running", "queued", "starting")
         for j in jobs.values()
     )
     if already:
-        return jsonify({"error": "A check is already running for this novel"}), 409
+        return jsonify({"error": "A check is already running or queued for this novel"}), 409
 
     scheduler._trigger(novel_id, watches[novel_id])
 
-    # Find the newly created job_id
+    # Find the newly created job_id (scheduler creates with status="queued")
     job_id = next(
-        (jid for jid, j in jobs.items() if j.get("novel_id") == novel_id and j.get("status") == "pending"),
+        (jid for jid, j in jobs.items() if j.get("novel_id") == novel_id and j.get("status") in ("queued", "pending")),
         None,
     )
     return jsonify({"ok": True, "job_id": job_id})

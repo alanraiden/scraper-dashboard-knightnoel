@@ -3,6 +3,9 @@
   "kn_api_url": "http://localhost:3000",
   "kn_api_key": "skpr_7f4a2b9e1c6d3f8a5b0e7d4c2a9f6e3b1d8c5a2",
 
+  "healthcheck_url": "",
+  "healthcheck_interval_seconds": 300,
+
   "tick_interval_seconds": 60,
   "staleness_check_interval_minutes": 30,
   "staleness_threshold_multiplier": 2.0,

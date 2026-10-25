@@ -218,8 +218,21 @@ def notify_stuck_job(job_id, novel_slug, running_minutes):
             f"**Job:** `{job_id}`\n"
             f"**Novel:** {novel_slug}\n"
             f"**Running for:** {running_minutes:.0f} minutes\n\n"
-            f"This job may be stuck. Consider cancelling it."
+            f"Will auto-cancel in 5 minutes if still running."
         ),
         color=COLOR_ORANGE,
+        footer="Knight Novel Scraper Bot",
+    ))
+
+
+def notify_watch_paused(novel_title, reason):
+    """Alert that a watch was auto-paused due to repeated timeouts."""
+    if not is_configured():
+        return
+
+    _send(_embed(
+        title=f"⏸️ Watch Auto-Paused: {novel_title}",
+        description=reason,
+        color=COLOR_RED,
         footer="Knight Novel Scraper Bot",
     ))

@@ -56,6 +56,8 @@ def generate_daily_report():
     power_recs   = daily.get("power_recoveries", 0)
     chapters     = daily.get("chapters_uploaded", 0)
     stuck_jobs   = daily.get("stuck_jobs_detected", 0)
+    auto_cancelled = daily.get("jobs_auto_cancelled", 0)
+    auto_paused  = daily.get("watches_auto_paused", 0)
 
     # Build report
     lines = []
@@ -76,7 +78,7 @@ def generate_daily_report():
     lines.append(f"📚 KN API: {kn_novels} novels in database")
 
     # Actions taken
-    if retries or chain_repairs or drift_fixes or power_recs or stuck_jobs:
+    if retries or chain_repairs or drift_fixes or power_recs or stuck_jobs or auto_cancelled or auto_paused:
         lines.append("")
         lines.append("**Bot actions today:**")
         if retries:
@@ -89,6 +91,20 @@ def generate_daily_report():
             lines.append(f"  🔌 {power_recs} power-cut recoveries")
         if stuck_jobs:
             lines.append(f"  ⏰ {stuck_jobs} stuck jobs detected")
+        if auto_cancelled:
+            lines.append(f"  🛑 {auto_cancelled} jobs auto-cancelled (timeout)")
+        if auto_paused:
+            lines.append(f"  ⏸️ {auto_paused} watches auto-paused (repeated timeouts)")
+
+    # Paused watches (needs manual review)
+    paused = state.get_paused_watches()
+    if paused:
+        lines.append("")
+        lines.append("**⚠️ Watches paused by bot (need manual review):**")
+        for novel_id, info in paused.items():
+            title  = info.get("title", novel_id)
+            reason = info.get("reason", "unknown")
+            lines.append(f"  ⏸ **{title}** — {reason}")
 
     # Stale watch details (top 5)
     if stale_watches > 0 and watches:
