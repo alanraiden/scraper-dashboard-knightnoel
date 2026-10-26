@@ -28,11 +28,16 @@ def _load():
 
 
 def _save(state):
+    """Write state atomically: write to .tmp then os.replace() so a crash
+    mid-write never leaves a corrupt bot_state.json."""
+    tmp = _STATE_FILE + ".tmp"
     try:
-        with open(_STATE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _STATE_FILE)
     except Exception as e:
         print(f"[Bot State] Error saving state: {e}")
+
 
 
 def get(key, default=None):
@@ -192,17 +197,29 @@ def get_all_timeouts():
 
 # ── Bot-paused watches tracking ──────────────────────────────────────────────
 
-def add_paused_watch(novel_id, novel_title, reason):
-    """Record that the bot paused a watch (for daily report)."""
+def add_paused_watch(novel_id, novel_slug, reason, source_url=""):
+    """Record that the bot paused a watch (for daily report and auto-resume)."""
     with _lock:
         state = _load()
         paused = state.setdefault("bot_paused", {})
         paused[novel_id] = {
-            "title": novel_title,
-            "reason": reason,
-            "paused_at": time.time(),
+            "novel_slug":      novel_slug,
+            "reason":          reason,
+            "paused_at":       time.time(),
+            "resume_attempts": 0,
+            "source_url":      source_url,
         }
         _save(state)
+
+
+def update_paused_watch_attempts(novel_id, attempt_count):
+    """Update the resume attempt counter for a bot-paused watch."""
+    with _lock:
+        state = _load()
+        paused = state.get("bot_paused", {})
+        if novel_id in paused:
+            paused[novel_id]["resume_attempts"] = attempt_count
+            _save(state)
 
 
 def get_paused_watches():

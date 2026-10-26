@@ -134,9 +134,12 @@ def _load_watches():
     return {}
 
 def _save_watches(watches):
-    """Persist watches to disk."""
-    with open(_WATCHES_FILE, "w", encoding="utf-8") as f:
+    """Persist watches to disk atomically (write to .tmp then os.replace).
+    Prevents a half-written file if the process crashes mid-write."""
+    tmp = _WATCHES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(watches, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, _WATCHES_FILE)
 
 # -- Scraper config -----------------------------------------------------------
 DEFAULT_DELAY      = 1.2
@@ -156,6 +159,56 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# -- Per-domain circuit breaker -----------------------------------------------
+# Tracks consecutive 403 responses per domain. After CIRCUIT_THRESHOLD failures
+# the circuit opens for CIRCUIT_OPEN_SECS seconds; no new watch jobs are queued
+# for that domain until it resets. Settings can be overridden per-run via the
+# scheduler (which reads watches.json, not from this global) but the defaults
+# here apply to the gate in WatchScheduler._tick.
+_domain_circuit      = {}     # domain → {"failures": N, "open_until": float}
+_domain_circuit_lock = threading.Lock()
+CIRCUIT_THRESHOLD    = 3      # consecutive 403s before opening
+CIRCUIT_OPEN_SECS   = 30 * 60  # 30 minutes open
+
+
+def _domain_of(url):
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return url
+
+
+def _circuit_record_failure(url):
+    """Record a 403 failure for the domain. Opens circuit after threshold."""
+    domain = _domain_of(url)
+    with _domain_circuit_lock:
+        entry = _domain_circuit.setdefault(domain, {"failures": 0, "open_until": 0})
+        entry["failures"] += 1
+        if entry["failures"] >= CIRCUIT_THRESHOLD:
+            entry["open_until"] = time.time() + CIRCUIT_OPEN_SECS
+            print(f"[CircuitBreaker] {domain} tripped after {entry['failures']} 403s — "
+                  f"closed for {CIRCUIT_OPEN_SECS//60} min")
+
+
+def _circuit_record_success(url):
+    """Reset failure counter on a successful fetch."""
+    domain = _domain_of(url)
+    with _domain_circuit_lock:
+        if domain in _domain_circuit:
+            _domain_circuit[domain]["failures"] = 0
+            # Leave open_until as-is; it will expire naturally
+
+
+def is_domain_circuit_open(url):
+    """Return True if the domain's circuit is currently open (no new jobs)."""
+    domain = _domain_of(url)
+    with _domain_circuit_lock:
+        entry = _domain_circuit.get(domain)
+        if not entry:
+            return False
+        return time.time() < entry.get("open_until", 0)
+
+
 
 # =============================================================================
 #  PAGE FETCH
@@ -168,6 +221,11 @@ def fetch_page(url, session, log_fn=None):
     for attempt in range(max_retries + 1):
         try:
             r = session.get(url, headers=HEADERS, timeout=20)
+            if r.status_code == 403:
+                _circuit_record_failure(url)
+                if log_fn:
+                    log_fn(f"HTTP 403 — site may be blocking scrapers (circuit breaker updated for {_domain_of(url)})", "warn")
+                return None, None
             if r.status_code in (502, 503, 504) and attempt < max_retries:
                 wait = backoff[attempt]
                 if log_fn:
@@ -175,6 +233,7 @@ def fetch_page(url, session, log_fn=None):
                 time.sleep(wait)
                 continue
             r.raise_for_status()
+            _circuit_record_success(url)
             return BeautifulSoup(r.text, "lxml"), r.text
         except requests.RequestException as e:
             if attempt < max_retries and any(
@@ -560,7 +619,7 @@ def run_scrape_job(job_id, params):
                 "ts":   int(time.time() * 1000),
             })
 
-    update({"status": "running", "logs": [], "stats": {"scraped": 0, "uploaded": 0, "skipped": 0, "errors": 0}, "started_at": time.time()})
+    update({"status": "running", "logs": [], "stats": {"scraped": 0, "uploaded": 0, "skipped": 0, "errors": 0}, "started_at": time.time(), "last_progress_at": time.time()})
 
     mode          = params.get("mode", "scrape")
     start_url     = params["start_url"]
@@ -726,6 +785,8 @@ def run_scrape_job(job_id, params):
 
                 else:
                     log(f"Ch.{ch_num} -- {title} ({wc}w)", "ok")
+                    # Record that progress was made — bot uses this for stuck-job detection
+                    update({"last_progress_at": time.time()})
                     # Accumulate into batch — flush every BATCH_SIZE or at end
                     upload_batch.append({"number": ch_num, "title": title, "content": content})
                     if len(upload_batch) >= BATCH_SIZE:
@@ -779,23 +840,43 @@ def run_scrape_job(job_id, params):
     update({"status": "done", "stats": stats})
 
     # ── Watch post-run update ─────────────────────────────────────────────────
-    # If this job was triggered by the WatchScheduler, write back lastChecked
+    # If this job was triggered by the WatchScheduler, write back lastChecked,
+    # lastChapter (FIX: was never written — caused Ch.0 to show in dashboard),
     # and lastChapterUrl so the next scheduled run starts from the right place.
     watch_novel_id = params.get("_watch_novel_id")
     if watch_novel_id:
         with jobs_lock:
-            job_logs = jobs.get(job_id, {}).get("logs", [])
+            job_logs  = jobs.get(job_id, {}).get("logs", [])
+            job_stats = jobs.get(job_id, {}).get("stats", {})
         with _watches_lock:
             watches = _load_watches()
             if watch_novel_id in watches:
                 w = watches[watch_novel_id]
                 w["lastChecked"] = time.time()
-                # Chain: update lastChapterUrl so next run starts where we left off
+
+                # ── Fix Ch.0 bug: derive highest chapter number from logs ──────
+                # Logs contain lines like "Ch.42 -- Title (123w)" (type "ok").
+                # We scan them in reverse to find the last successfully uploaded ch.
+                highest_ch = 0
+                for entry in reversed(job_logs):
+                    msg = entry.get("msg", "")
+                    if entry.get("type") == "ok" and msg.startswith("Ch."):
+                        m = re.match(r"Ch\.(\d+)", msg)
+                        if m:
+                            highest_ch = max(highest_ch, int(m.group(1)))
+                            break   # reversed → first match is the highest
+
+                # Only advance lastChapter, never go backwards
+                if highest_ch > w.get("lastChapter", 0):
+                    w["lastChapter"] = highest_ch
+
+                # ── Chain: update lastChapterUrl so next run starts here ───────
                 if w.get("mode") == "chain":
                     for entry in reversed(job_logs):
                         if "__last_chapter_url__:" in entry.get("msg", ""):
                             w["lastChapterUrl"] = entry["msg"].split("__last_chapter_url__:")[1].strip()
                             break
+
                 _save_watches(watches)
 
 
@@ -811,14 +892,25 @@ def health():
         limit   = WATCH_CONCURRENCY
         stagger = STAGGER_DELAY
     active = max(0, limit - _semaphore._value)
+    # Expose open circuit breakers so the bot and dashboard can see them
+    now = time.time()
+    with _domain_circuit_lock:
+        open_circuits = [
+            {"domain": d, "failures": e["failures"],
+             "open_until": e["open_until"],
+             "minutes_remaining": max(0, round((e["open_until"] - now) / 60, 1))}
+            for d, e in _domain_circuit.items()
+            if now < e.get("open_until", 0)
+        ]
     return jsonify({
-        "status":        "ok",
-        "port":          PORT,
-        "min_words":     MIN_CONTENT_WORDS,
-        "concurrency":   limit,
-        "stagger_delay": stagger,
-        "active_jobs":   active,
-        "queued_jobs":   queued,
+        "status":         "ok",
+        "port":           PORT,
+        "min_words":      MIN_CONTENT_WORDS,
+        "concurrency":    limit,
+        "stagger_delay":  stagger,
+        "active_jobs":    active,
+        "queued_jobs":    queued,
+        "open_circuits":  open_circuits,
     })
 
 
@@ -928,11 +1020,12 @@ def list_jobs():
     with jobs_lock:
         snapshot = {
             jid: {
-                "status":     j.get("status"),
-                "started_at": j.get("started_at"),
-                "novel_slug": (j.get("params") or {}).get("novel_slug") or (j.get("params") or {}).get("novel_id"),
-                "novel_id":   (j.get("params") or {}).get("novel_id"),
-                "stats":      j.get("stats", {}),
+                "status":           j.get("status"),
+                "started_at":       j.get("started_at"),
+                "last_progress_at": j.get("last_progress_at"),   # v4: progress-based stuck detection
+                "novel_slug":       (j.get("params") or {}).get("novel_slug") or (j.get("params") or {}).get("novel_id"),
+                "novel_id":         (j.get("params") or {}).get("novel_id"),
+                "stats":            j.get("stats", {}),
             }
             for jid, j in jobs.items()
         }
@@ -1256,6 +1349,12 @@ class WatchScheduler:
             if already_running:
                 continue
             if now - last_checked >= interval_secs:
+                # v5: skip if the source domain is circuit-breaker open
+                source_url = w.get("startUrl", "") or w.get("lastChapterUrl", "")
+                if source_url and is_domain_circuit_open(source_url):
+                    domain = _domain_of(source_url)
+                    print(f"[Scheduler] Skipping {w.get('novelTitle', novel_id)} — domain {domain} circuit is open")
+                    continue
                 due.append((novel_id, w))
 
         if not due:

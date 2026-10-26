@@ -236,3 +236,68 @@ def notify_watch_paused(novel_title, reason):
         color=COLOR_RED,
         footer="Knight Novel Scraper Bot",
     ))
+
+
+# ── v5 notifications ──────────────────────────────────────────────────────────
+
+def notify_watch_resumed(novel_title, reason):
+    """Confirm that a bot-paused watch was auto-resumed."""
+    if not is_configured():
+        return
+    _send(_embed(
+        title=f"▶️ Watch Auto-Resumed: {novel_title}",
+        description=reason,
+        color=COLOR_GREEN,
+        footer="Knight Novel Scraper Bot v5",
+    ))
+
+
+def notify_watch_completed(novel_title):
+    """Alert that a watch was deactivated because the novel is completed on KN."""
+    if not is_configured():
+        return
+    _send(_embed(
+        title=f"✅ Novel Completed — Watch Stopped: {novel_title}",
+        description=(
+            f"**{novel_title}** is marked as **Completed** in Knight Novel.\n\n"
+            f"The auto-watch has been deactivated to stop unnecessary scrape attempts.\n"
+            f"Re-enable it from the dashboard if you want to continue checking."
+        ),
+        color=COLOR_GREEN,
+        footer="Knight Novel Scraper Bot v5",
+    ))
+
+
+def notify_chapter_gaps(gap_list):
+    """
+    Report missing chapters detected in KN's chapter sequence.
+    gap_list: [{novel_title, novel_slug, missing: [ints], max_ch: int}]
+    """
+    if not is_configured():
+        return
+
+    lines = []
+    for item in gap_list[:10]:  # cap to 10 novels per alert
+        missing = item["missing"]
+        title   = item["novel_title"]
+        max_ch  = item["max_ch"]
+        if len(missing) <= 10:
+            ch_list = ", ".join(str(c) for c in missing)
+        else:
+            ch_list = ", ".join(str(c) for c in missing[:10]) + f" … (+{len(missing)-10} more)"
+        lines.append(f"**{title}** — missing {len(missing)} ch of {max_ch}: {ch_list}")
+
+    total = len(gap_list)
+    description = (
+        f"Gap scan found missing chapters in **{total}** novel(s).\n"
+        f"Automated backfill is not attempted — trigger a one-shot scrape "
+        f"from the dashboard for each affected novel.\n\n"
+        + "\n".join(lines)
+    )
+    _send(_embed(
+        title=f"🔍 Chapter Gaps Detected ({total} novel{'s' if total != 1 else ''})",
+        description=description,
+        color=COLOR_ORANGE,
+        footer="Knight Novel Scraper Bot v5",
+    ))
+

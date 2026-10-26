@@ -97,10 +97,14 @@ def recover_watch(diagnosed_entry):
     # ── Chain URL dead — attempt to repair ────────────────────────────────
     if diag == DIAG_CHAIN_URL_DEAD:
         logger.info(f"[{title}] Chain URL is dead — attempting repair...", novel_id=novel_id)
-        new_url = _repair_chain_url(watch)
+        new_url, repaired_ch = _repair_chain_url(watch)
         if new_url:
-            logger.info(f"[{title}] Repaired chain URL → {new_url}", novel_id=novel_id)
-            success = health.patch_watch(novel_id, {"lastChapterUrl": new_url})
+            logger.info(f"[{title}] Repaired chain URL → {new_url} (Ch.{repaired_ch})", novel_id=novel_id)
+            # Patch both URL and chapter number so next run won't re-upload old chapters
+            patch = {"lastChapterUrl": new_url}
+            if repaired_ch > 0:
+                patch["lastChapter"] = repaired_ch
+            success = health.patch_watch(novel_id, patch)
             if success:
                 state.add_daily_stat("chain_repairs")
                 return _trigger_and_track(novel_id, slug, title, "chain_repair")
@@ -109,6 +113,7 @@ def recover_watch(diagnosed_entry):
         else:
             logger.warn(f"[{title}] Could not find a replacement chain URL", novel_id=novel_id)
             return {"action": "alert", "success": False, "message": f"Chain URL dead and could not auto-repair for {title}"}
+
 
     # ── Simple overdue — just re-trigger ──────────────────────────────────
     if diag == DIAG_OVERDUE:
@@ -146,16 +151,16 @@ def _repair_chain_url(watch):
     Attempt to find the correct latest chapter URL by scraping the novel's
     index page (startUrl) and finding the highest chapter link.
 
-    Returns the repaired URL or None.
+    Returns (url, chapter_num) or (None, 0).
     """
     start_url = watch.get("startUrl", "")
     if not start_url:
-        return None
+        return None, 0
 
     try:
         r = requests.get(start_url, headers=HEADERS, timeout=20)
         if r.status_code != 200:
-            return None
+            return None, 0
 
         soup = BeautifulSoup(r.text, "lxml")
 
@@ -201,11 +206,11 @@ def _repair_chain_url(watch):
 
         if best_url:
             logger.debug(f"Chain repair: found Ch.{best_num} at {best_url}")
-        return best_url
+        return best_url, best_num
 
     except Exception as e:
         logger.error(f"Chain URL repair failed: {e}")
-        return None
+        return None, 0
 
 
 def run_power_recovery(stale_diagnosed):

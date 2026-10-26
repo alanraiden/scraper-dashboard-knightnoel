@@ -97,7 +97,7 @@ export default function NovelCard({ novel, watchEntry, isWatching, isRunning, on
             {watchEntry?.lastChapter > 0 && <span className={`${styles.pill} ${styles.pillAccent}`}>last: Ch.{watchEntry.lastChapter}</span>}
             {isRunning && <span className={`${styles.pill} ${styles.pillRunning}`}><RefreshCw size={10} className={styles.spin}/> running…</span>}
             {isQueued && <span className={`${styles.pill} ${styles.pillQueued}`}>⏳ Queued #{queuePosition}</span>}
-            {isPaused && <span className={`${styles.pill} ${styles.pillPaused}`}>⏸ Paused — resuming soon</span>}
+            {isPaused && <span className={`${styles.pill} ${styles.pillPaused}`} title="Auto-paused after repeated timeouts — bot will auto-resume after cooldown">⏸ Bot-paused</span>}
             {hasError && (
               <span className={`${styles.pill} ${styles.pillError}`} title={lastLog.msg}>
                 ✗ last run failed

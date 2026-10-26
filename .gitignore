@@ -22,6 +22,11 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
+# Scraper bot secrets & runtime state — never commit these
+scraper-server/bot_config.json
+scraper-server/bot_state.json
+scraper-server/watches.json
+
 # Keep only the example file
 !.env.example
 

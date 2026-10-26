@@ -1,0 +1,36 @@
+{
+  "scraper_url": "http://localhost:7832",
+  "kn_api_url": "https://your-site.example.com",
+
+  "kn_api_key": "",
+  "_kn_api_key_note": "Set via env var KN_API_KEY (preferred) or paste key here (keep out of git!)",
+
+  "healthcheck_url": "",
+  "_healthcheck_url_note": "Optional: healthchecks.io ping URL. Env var: HEALTHCHECK_URL",
+  "healthcheck_interval_seconds": 300,
+
+  "tick_interval_seconds": 60,
+  "staleness_check_interval_minutes": 30,
+  "staleness_threshold_multiplier": 2.0,
+
+  "recovery": {
+    "enabled": true,
+    "batch_size": 3,
+    "batch_gap_minutes": 10,
+    "restart_uptime_threshold_seconds": 600
+  },
+
+  "auto_retry": {
+    "enabled": true,
+    "max_retries_per_day": 3,
+    "retry_delay_minutes": 15
+  },
+
+  "notifications": {
+    "discord_webhook_url": "",
+    "_discord_webhook_url_note": "Set via env var DISCORD_WEBHOOK (preferred) or paste URL here (keep out of git!)",
+    "daily_digest_hour": 9
+  },
+
+  "log_dir": "bot_logs"
+}

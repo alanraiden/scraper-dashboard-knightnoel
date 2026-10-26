@@ -1,5 +1,10 @@
 """
 bot/config.py — Load and validate bot configuration.
+
+Secret precedence (highest first):
+  1. Environment variables: KN_API_KEY, DISCORD_WEBHOOK, HEALTHCHECK_URL
+  2. bot_config.json  (copy bot_config.example.json → bot_config.json to start)
+  3. Built-in defaults
 """
 
 import json
@@ -23,32 +28,67 @@ DEFAULT_CONFIG = {
     # Power-cut recovery
     "recovery": {
         "enabled": True,
-        # Feed stale watches in batches after a detected restart
         "batch_size": 3,
-        # Minutes to wait between recovery batches
         "batch_gap_minutes": 10,
-        # Server uptime (seconds) below which we consider it a fresh restart
         "restart_uptime_threshold_seconds": 600,
     },
 
-    # Auto-retry
+    # Auto-retry failed / overdue watches
     "auto_retry": {
         "enabled": True,
-        # Max retries per watch per day
         "max_retries_per_day": 3,
-        # Minutes to wait before retrying a failed watch
         "retry_delay_minutes": 15,
+    },
+
+    # v5: Auto-resume watches that were bot-paused (after repeated timeouts).
+    # Checks that the source site is reachable before re-enabling.
+    "auto_resume": {
+        "enabled": True,
+        "resume_after_hours": 6,    # hours to wait before trying
+        "max_resume_attempts": 3,   # give up after N auto-resumes (needs manual review)
+    },
+
+    # v5: Per-domain circuit breaker — prevents burning retries on a site that
+    # is rate-limiting or blocking.  Triggered by consecutive 403 responses
+    # from the same domain within a single scrape job.
+    "circuit_breaker": {
+        "enabled": True,
+        "failure_threshold": 3,     # consecutive 403s to trip the breaker
+        "open_minutes": 30,         # minutes to stay open before auto-reset
+    },
+
+    # v5: Adaptive check intervals — slow down or stop watching novels that
+    # haven't had new content in a long time, or are marked completed on KN.
+    "adaptive_intervals": {
+        "enabled": True,
+        "inactive_days": 30,        # days since last new chapter → slow down
+        "interval_multiplier": 2.0, # multiply intervalHours by this factor
+        "max_interval_hours": 48,   # cap so it never exceeds this
+        "stop_on_completed": True,  # deactivate watch when KN status == "completed"
+    },
+
+    # v5: Gap detection — compare chapter sequence on KN and report holes.
+    # Automated backfill is NOT attempted (chain-mode URL resolution is risky).
+    "gap_detection": {
+        "enabled": True,
+        "check_interval_hours": 24, # how often to run gap checks
+        "alert_threshold": 1,       # only alert if >= this many chapters are missing
     },
 
     # Notifications
     "notifications": {
         "discord_webhook_url": "",
-        # Send daily digest at this hour (24h format, server local time)
         "daily_digest_hour": 9,
     },
 
+    # v5: Delete bot_logs/*.jsonl files older than this many days at startup
+    "log_retention_days": 30,
+
     # Logging
     "log_dir": "bot_logs",
+
+    # v5: Config hot-reload — re-read bot_config.json every N ticks (0 = off)
+    "config_reload_ticks": 10,
 }
 
 
@@ -73,7 +113,6 @@ def load_config(config_path=None):
             print(f"[Bot Config] Error reading {config_path}: {e}")
             user_config = {}
     else:
-        # Create default config file so user can edit it
         user_config = {}
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -84,10 +123,26 @@ def load_config(config_path=None):
 
     _config = _deep_merge(DEFAULT_CONFIG, user_config)
 
-    # Validate critical fields
+    # ── Override secrets from environment variables (highest priority) ────────
+    env_kn_key  = os.environ.get("KN_API_KEY", "").strip()
+    env_webhook = os.environ.get("DISCORD_WEBHOOK", "").strip()
+    env_hc_url  = os.environ.get("HEALTHCHECK_URL", "").strip()
+
+    if env_kn_key:
+        _config["kn_api_key"] = env_kn_key
+    if env_webhook:
+        _config.setdefault("notifications", {})["discord_webhook_url"] = env_webhook
+    if env_hc_url:
+        _config["healthcheck_url"] = env_hc_url
+
+    # ── Validate critical fields ──────────────────────────────────────────────
     if not _config.get("kn_api_key"):
         print("[Bot Config] WARNING: kn_api_key is empty — KN API calls will fail.")
-        print("             Edit bot_config.json and set your scraper API key.")
+        print("             Set env var KN_API_KEY=<key> or edit bot_config.json.")
+
+    if not _config.get("notifications", {}).get("discord_webhook_url"):
+        print("[Bot Config] WARNING: discord_webhook_url is empty — no Discord alerts will be sent.")
+        print("             Set env var DISCORD_WEBHOOK=<url> or edit bot_config.json.")
 
     return _config
 

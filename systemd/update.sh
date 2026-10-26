@@ -118,9 +118,30 @@ if git diff --name-only "$LOCAL" "$REMOTE" | grep -q "^systemd/"; then
 fi
 
 # ---------------------------------------------------------------------------
-# Restart services
+# ---------------------------------------------------------------------------
+# Restart services + health-check + rollback on failure
 # ---------------------------------------------------------------------------
 log "Restarting scraper and dashboard services..."
-systemctl restart scraper dashboard \
-    && log "Update complete! Now running commit: $(git rev-parse --short HEAD)" \
-    || log "WARNING: systemctl restart returned an error â€” check 'journalctl -u scraper -u dashboard'"
+systemctl restart scraper dashboard
+sleep 5
+
+log "Waiting for scraper server to become healthy (up to 60s)..."
+HEALTHY=false
+for i in $(seq 1 12); do
+    if curl -sf http://localhost:7832/health > /dev/null 2>&1; then
+        HEALTHY=true
+        log "Health check passed -- update complete! Now at: $(git rev-parse --short HEAD)"
+        break
+    fi
+    sleep 5
+done
+
+if [ "$HEALTHY" = false ]; then
+    log "FATAL: Health check failed after 60s -- rolling back to $LOCAL"
+    git reset --hard "$LOCAL"
+    [[ -d "$VENV_DIR" ]] && "$VENV_DIR/bin/pip" install -r "$REQ" -q 2>&1 | logger -t "$LOG_TAG" || true
+    systemctl restart scraper dashboard \
+        && log "Rollback OK -- running $(git rev-parse --short HEAD)" \
+        || log "WARNING: rollback restart also failed -- check journalctl -u scraper"
+    exit 2
+fi

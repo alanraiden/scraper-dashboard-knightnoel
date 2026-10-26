@@ -225,6 +225,24 @@ def get_kn_novel(slug):
     return None
 
 
+def get_kn_chapters(slug):
+    """Fetch the chapter list for a novel from the KN API (used for gap detection)."""
+    cfg = get_config()
+    if not cfg.get("kn_api_key"):
+        return None
+    url  = f"{cfg['kn_api_url'].rstrip('/')}/api/scraper/novels/{slug}/chapters"
+    hdrs = {"x-scraper-key": cfg["kn_api_key"]}
+    try:
+        r = requests.get(url, headers=hdrs, timeout=30)
+        if r.ok:
+            data = r.json()
+            # Accept both {chapters: [...]} and a direct list
+            return data.get("chapters", data) if isinstance(data, dict) else data
+    except Exception as e:
+        logger.error(f"Failed to fetch chapters for {slug}: {e}")
+    return None
+
+
 def check_source_url(url):
     """
     Quick HEAD/GET check on a source novel URL to see if it's reachable.

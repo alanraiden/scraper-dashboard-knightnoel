@@ -45,15 +45,19 @@ from bot.reporter import generate_daily_report, should_send_digest, mark_digest_
 # ── Globals ───────────────────────────────────────────────────────────────────
 
 _running = True
-_last_staleness_check = 0
-_last_heartbeat       = 0
-_scraper_was_down     = False
-_kn_was_down          = False
+_last_staleness_check  = 0
+_last_heartbeat        = 0
+_last_gap_check        = 0
+_last_adaptive_check   = 0
+_scraper_was_down      = False
+_kn_was_down           = False
 
-# Stuck job tracking: job_id → {"first_seen": timestamp, "novel_slug": str, "novel_id": str, "alerted": bool}
+# Stuck job tracking: job_id → {"no_progress_since": ts, novel_slug, alerted, cancelled}
 _stuck_job_tracker    = {}
-STUCK_JOB_THRESHOLD   = 30 * 60   # 30 minutes — alert
-AUTO_CANCEL_THRESHOLD = 35 * 60   # 35 minutes — auto-cancel (5 min grace after alert)
+# v4: detect stuck by LACK OF PROGRESS, not wall-clock age.
+NO_PROGRESS_ALERT  = 10 * 60   # 10 min no progress → alert
+NO_PROGRESS_CANCEL = 13 * 60   # 13 min no progress → auto-cancel (3 min grace)
+ABS_MAX_JOB_TIME   = 6 * 60 * 60  # 6 h absolute cap — catches true infinite loops
 MAX_TIMEOUTS_BEFORE_PAUSE = 3     # Pause watch after 3 timeouts
 
 # Alert deduplication: set of novel_ids we already alerted about this session.
@@ -105,7 +109,7 @@ def main():
 
     cfg = load_config()
     logger.info("=" * 56)
-    logger.info("  Knight Novel Scraper Bot v3 starting...")
+    logger.info("  Knight Novel Scraper Bot v5 starting...")
     logger.info("=" * 56)
     logger.info(f"  Scraper server: {cfg['scraper_url']}")
     logger.info(f"  KN API:         {cfg['kn_api_url']}")
@@ -113,8 +117,14 @@ def main():
     logger.info(f"  Heartbeat:      {'configured' if cfg.get('healthcheck_url') else 'not configured'}")
     logger.info(f"  Tick interval:  {cfg['tick_interval_seconds']}s")
     logger.info(f"  Auto-retry:     {'enabled' if cfg['auto_retry']['enabled'] else 'disabled'}")
-    logger.info(f"  Auto-cancel:    stuck jobs after {AUTO_CANCEL_THRESHOLD // 60} min")
+    logger.info(f"  Auto-resume:    {'enabled' if cfg.get('auto_resume', {}).get('enabled') else 'disabled'}")
+    logger.info(f"  Circuit breaker:{'enabled' if cfg.get('circuit_breaker', {}).get('enabled') else 'disabled'}")
+    logger.info(f"  Adaptive ivl:   {'enabled' if cfg.get('adaptive_intervals', {}).get('enabled') else 'disabled'}")
+    logger.info(f"  Gap detection:  {'enabled' if cfg.get('gap_detection', {}).get('enabled') else 'disabled'}")
     logger.info("=" * 56)
+
+    # v5: Purge old log files at startup
+    _purge_old_logs(cfg)
 
     # Record startup and check if this is a crash recovery scenario
     prev_startup = state.record_startup()
@@ -123,13 +133,17 @@ def main():
     tick = 0
     while _running:
         try:
+            # v5: Config hot-reload — re-read bot_config.json every N ticks
+            reload_every = cfg.get("config_reload_ticks", 10)
+            if reload_every > 0 and tick > 0 and tick % reload_every == 0:
+                cfg = load_config()
+
             _tick(cfg, tick)
         except Exception as e:
             logger.error(f"Tick error: {e}")
             logger.error(traceback.format_exc())
 
         tick += 1
-        # Sleep in small increments so we respond to SIGTERM quickly
         sleep_total = cfg["tick_interval_seconds"]
         slept = 0
         while slept < sleep_total and _running:
@@ -141,34 +155,32 @@ def main():
 
 def _tick(cfg, tick_number):
     """One iteration of the main loop."""
-    global _last_staleness_check, _scraper_was_down, _kn_was_down
+    global _last_staleness_check, _last_gap_check, _last_adaptive_check
+    global _scraper_was_down, _kn_was_down
 
     # ── 0. Dead man's switch ping ─────────────────────────────────────────
     _ping_heartbeat()
 
     # ── 1. Health checks (every tick) ─────────────────────────────────────
-
     scraper = health.check_scraper_server()
     if not scraper.get("alive"):
         consecutive = scraper.get("consecutive_failures", 1)
         logger.error(f"Scraper server DOWN: {scraper.get('error')} (failure #{consecutive})")
-        # Alert on first failure, then every 5th
         if consecutive == 1 or consecutive % 5 == 0:
             notifications.notify_server_down("Scraper Server", scraper.get("error", "?"), consecutive)
         _scraper_was_down = True
-        return  # Can't do anything else if scraper is down
+        return
     else:
         if _scraper_was_down:
             logger.info("Scraper server recovered!")
             notifications.notify_server_recovered("Scraper Server")
             _scraper_was_down = False
-        if tick_number % 10 == 0:  # Log health every 10 ticks (~10 min)
+        if tick_number % 10 == 0:
             logger.debug(
                 f"Scraper healthy — {scraper.get('active_jobs', 0)} active, "
                 f"{scraper.get('queued_jobs', 0)} queued"
             )
 
-    # KN API check (every 5 ticks to avoid spamming)
     if tick_number % 5 == 0:
         kn = health.check_kn_api()
         if kn.get("alive") is False:
@@ -183,20 +195,35 @@ def _tick(cfg, tick_number):
             _kn_was_down = False
 
     # ── 2. Stuck job detection + auto-cancel (every tick) ─────────────────
-
     _check_stuck_jobs()
 
     # ── 3. Staleness check (periodic) ─────────────────────────────────────
-
     staleness_interval = cfg.get("staleness_check_interval_minutes", 30) * 60
     now = time.time()
-
     if now - _last_staleness_check >= staleness_interval:
         _last_staleness_check = now
         _run_staleness_check(cfg)
 
-    # ── 4. Daily digest ───────────────────────────────────────────────────
+    # ── 4. v5: Auto-resume bot-paused watches (every tick, cheap check) ───
+    if cfg.get("auto_resume", {}).get("enabled", True):
+        _check_auto_resume(cfg)
 
+    # ── 5. v5: Adaptive interval & completed-novel detection (hourly) ──────
+    adaptive_interval = 60 * 60  # 1 hour
+    if cfg.get("adaptive_intervals", {}).get("enabled", True):
+        if now - _last_adaptive_check >= adaptive_interval:
+            _last_adaptive_check = now
+            _check_adaptive_intervals(cfg)
+
+    # ── 6. v5: Gap detection (configurable, default 24 h) ─────────────────
+    gap_cfg = cfg.get("gap_detection", {})
+    if gap_cfg.get("enabled", True):
+        gap_interval = gap_cfg.get("check_interval_hours", 24) * 3600
+        if now - _last_gap_check >= gap_interval:
+            _last_gap_check = now
+            _check_chapter_gaps(cfg)
+
+    # ── 7. Daily digest ───────────────────────────────────────────────────
     if should_send_digest():
         _send_daily_digest()
 
@@ -389,8 +416,17 @@ def _check_crash_recovery(cfg):
 
 def _check_stuck_jobs():
     """
-    Detect jobs running too long, auto-cancel them, and track timeouts per novel.
-    After 3 timeouts for the same novel, pause its watch and alert once.
+    v4: Detect stuck jobs by lack of progress (last_progress_at not moving),
+    NOT by wall-clock age.  A 1000-chapter job running for 2 h is healthy;
+    a job that scraped 0 chapters in the last 10 min is broken.
+
+    Stages:
+      1. NO_PROGRESS_ALERT  (10 min) — alert via Discord, add to tracker.
+      2. NO_PROGRESS_CANCEL (13 min) — auto-cancel, track timeout count.
+      3. ABS_MAX_JOB_TIME   (6 h)   — force-cancel regardless of progress
+                                       (guards infinite-redirect loops).
+      4. After MAX_TIMEOUTS_BEFORE_PAUSE timeouts, deactivate the watch.
+    If progress is made (last_progress_at advances), remove from tracker.
     """
     global _stuck_job_tracker
 
@@ -401,7 +437,6 @@ def _check_stuck_jobs():
     now = time.time()
     active_ids = set()
 
-    # all_jobs is a dict of {job_id: job_data}
     items = all_jobs.items() if isinstance(all_jobs, dict) else []
 
     for job_id, job_data in items:
@@ -414,58 +449,94 @@ def _check_stuck_jobs():
         if not started_at:
             continue
 
-        running_secs = now - started_at
         novel_slug = job_data.get("novel_slug", job_data.get("novel_id", "unknown"))
         novel_id   = job_data.get("novel_id", novel_slug)
+        running_secs = now - started_at
 
-        # ── Phase 1: Alert at 30 min ────────────────────────────────────
-        if running_secs >= STUCK_JOB_THRESHOLD and job_id not in _stuck_job_tracker:
+        # ── Absolute safety cap (infinite-redirect / runaway loop) ───────────
+        if running_secs >= ABS_MAX_JOB_TIME:
+            if job_id not in _stuck_job_tracker or not _stuck_job_tracker[job_id].get("cancelled"):
+                logger.warn(f"Force-cancelling {job_id} ({novel_slug}) — hit {ABS_MAX_JOB_TIME/3600:.0f}h absolute cap")
+                _do_cancel(job_id, novel_slug, novel_id, running_secs / 60, force=True)
+            continue
+
+        # ── Progress-based detection ─────────────────────────────────────────
+        # Prefer last_progress_at; fall back to started_at if the server is
+        # older and doesn't send it yet.
+        last_progress = job_data.get("last_progress_at") or started_at
+        no_progress_secs = now - last_progress
+
+        if no_progress_secs < NO_PROGRESS_ALERT:
+            # Job is making progress — clear any stale tracker entry
+            if job_id in _stuck_job_tracker:
+                logger.info(f"Job {job_id} ({novel_slug}) resumed making progress — cleared stuck flag")
+                _stuck_job_tracker.pop(job_id, None)
+            continue
+
+        # ── Phase 1: Alert at 10 min no-progress ────────────────────────────
+        if job_id not in _stuck_job_tracker:
             _stuck_job_tracker[job_id] = {
-                "first_seen": now,
-                "novel_slug": novel_slug,
-                "novel_id":   novel_id,
-                "alerted":    True,
-                "cancelled":  False,
+                "no_progress_since": last_progress,
+                "novel_slug":        novel_slug,
+                "novel_id":          novel_id,
+                "alerted":           False,
+                "cancelled":         False,
             }
-            running_mins = running_secs / 60
-            logger.warn(f"Stuck job detected: {job_id} ({novel_slug}) running for {running_mins:.0f} min — will auto-cancel in 5 min")
-            notifications.notify_stuck_job(job_id, novel_slug, running_mins)
+
+        tracker = _stuck_job_tracker[job_id]
+
+        if not tracker.get("alerted"):
+            tracker["alerted"] = True
+            np_mins = no_progress_secs / 60
+            logger.warn(
+                f"Stuck job: {job_id} ({novel_slug}) — no progress for {np_mins:.0f} min "
+                f"(total running {running_secs/60:.0f} min) — will cancel in "
+                f"{(NO_PROGRESS_CANCEL - NO_PROGRESS_ALERT) / 60:.0f} min"
+            )
+            notifications.notify_stuck_job(job_id, novel_slug, running_secs / 60)
             state.add_daily_stat("stuck_jobs_detected")
 
-        # ── Phase 2: Auto-cancel at 35 min ──────────────────────────────
-        if running_secs >= AUTO_CANCEL_THRESHOLD and job_id in _stuck_job_tracker:
-            tracker = _stuck_job_tracker[job_id]
-            if not tracker.get("cancelled"):
-                tracker["cancelled"] = True
-                running_mins = running_secs / 60
-                logger.warn(f"Auto-cancelling stuck job {job_id} ({novel_slug}) after {running_mins:.0f} min")
+        # ── Phase 2: Auto-cancel at 13 min no-progress ──────────────────────
+        if not tracker.get("cancelled") and no_progress_secs >= NO_PROGRESS_CANCEL:
+            tracker["cancelled"] = True
+            _do_cancel(job_id, novel_slug, novel_id, running_secs / 60, force=False)
 
-                success = health.cancel_job(job_id)
-                if success:
-                    logger.info(f"Job {job_id} cancelled successfully")
-                    state.add_daily_stat("jobs_auto_cancelled")
-
-                    # Track timeouts for this novel
-                    timeout_count = state.increment_timeout(novel_id)
-                    logger.info(f"[{novel_slug}] Timeout #{timeout_count} of {MAX_TIMEOUTS_BEFORE_PAUSE}")
-
-                    # ── Phase 3: Pause watch after 3 timeouts ───────────
-                    if timeout_count >= MAX_TIMEOUTS_BEFORE_PAUSE:
-                        logger.warn(f"[{novel_slug}] Timed out {timeout_count}× — pausing watch (possible pagination loop?)")
-                        health.patch_watch(novel_id, {"active": False})
-                        state.add_paused_watch(novel_id, novel_slug, f"Auto-paused: timed out {timeout_count}× — check for pagination loop or site changes")
-                        state.add_daily_stat("watches_auto_paused")
-                        notifications.notify_watch_paused(
-                            novel_slug,
-                            f"Timed out {timeout_count} times. Paused to prevent resource waste. "
-                            f"Possible causes: pagination loop, site layout changed, or Cloudflare blocking.\n"
-                            f"Check manually and re-enable from the dashboard."
-                        )
-                else:
-                    logger.error(f"Failed to cancel job {job_id}")
-
-    # Clean up tracker for jobs that are no longer active
+    # Clean up tracker entries for jobs that finished / were cancelled externally
     _stuck_job_tracker = {k: v for k, v in _stuck_job_tracker.items() if k in active_ids}
+
+
+def _do_cancel(job_id, novel_slug, novel_id, running_mins, *, force=False):
+    """Cancel a stuck job, track the timeout, and auto-pause if needed."""
+    reason = "absolute time cap" if force else f"no progress for {NO_PROGRESS_CANCEL // 60} min"
+    logger.warn(f"Auto-cancelling {job_id} ({novel_slug}) after {running_mins:.0f} min total ({reason})")
+
+    success = health.cancel_job(job_id)
+    if success:
+        logger.info(f"Job {job_id} cancelled successfully")
+        state.add_daily_stat("jobs_auto_cancelled")
+
+        timeout_count = state.increment_timeout(novel_id)
+        logger.info(f"[{novel_slug}] Timeout #{timeout_count} of {MAX_TIMEOUTS_BEFORE_PAUSE}")
+
+        if timeout_count >= MAX_TIMEOUTS_BEFORE_PAUSE:
+            logger.warn(f"[{novel_slug}] Timed out {timeout_count}\u00d7 — pausing watch")
+            health.patch_watch(novel_id, {"active": False})
+            state.add_paused_watch(
+                novel_id, novel_slug,
+                f"Auto-paused: no progress {timeout_count}\u00d7 — "
+                f"check for pagination loop, site layout change, or Cloudflare block.",
+                source_url=job_data.get("last_progress_url", ""),
+            )
+            state.add_daily_stat("watches_auto_paused")
+            notifications.notify_watch_paused(
+                novel_slug,
+                f"No scraping progress detected {timeout_count} times. "
+                f"Paused to prevent resource waste.\n"
+                f"Possible causes: pagination loop, site layout changed, Cloudflare blocking.\n"
+                f"Check manually and re-enable from the dashboard."
+            )
+    else:
+        logger.error(f"Failed to cancel job {job_id}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -486,8 +557,232 @@ def _send_daily_digest():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  v5: LOG PURGE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _purge_old_logs(cfg):
+    """Delete bot_logs/*.jsonl files older than log_retention_days at startup."""
+    retention_days = cfg.get("log_retention_days", 30)
+    log_dir = cfg.get("log_dir", "bot_logs")
+    if not os.path.isdir(log_dir):
+        return
+    cutoff = time.time() - retention_days * 86400
+    deleted = 0
+    for fname in os.listdir(log_dir):
+        if not fname.endswith(".jsonl"):
+            continue
+        fpath = os.path.join(log_dir, fname)
+        try:
+            if os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                deleted += 1
+        except Exception:
+            pass
+    if deleted:
+        logger.info(f"Purged {deleted} log file(s) older than {retention_days} days from {log_dir}/")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  v5: AUTO-RESUME BOT-PAUSED WATCHES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _check_auto_resume(cfg):
+    """
+    Re-enable watches that were auto-paused by the bot (after repeated timeouts).
+
+    A watch is eligible for auto-resume if:
+      1. It is recorded in bot_state["bot_paused"].
+      2. It has been paused for >= auto_resume.resume_after_hours.
+      3. The source site is reachable (HEAD request succeeds).
+      4. It hasn't exceeded auto_resume.max_resume_attempts.
+
+    On successful resume: resets the timeout counter, removes from paused list,
+    re-enables the watch via PATCH /watches/<id>, and notifies Discord.
+    """
+    resume_cfg = cfg.get("auto_resume", {})
+    resume_after = resume_cfg.get("resume_after_hours", 6) * 3600
+    max_attempts = resume_cfg.get("max_resume_attempts", 3)
+
+    paused = state.get("bot_paused", {})
+    if not paused:
+        return
+
+    now = time.time()
+    for novel_id, info in list(paused.items()):
+        paused_at      = info.get("paused_at", 0)
+        resume_count   = info.get("resume_attempts", 0)
+        novel_slug     = info.get("novel_slug", novel_id)
+        source_url     = info.get("source_url", "")
+
+        if now - paused_at < resume_after:
+            continue  # Too early
+
+        if resume_count >= max_attempts:
+            # Give up — needs manual intervention
+            logger.warn(
+                f"[{novel_slug}] Paused watch has hit max auto-resume attempts ({max_attempts}) "
+                f"— needs manual review and re-enable from the dashboard."
+            )
+            continue
+
+        # Check if the source site is reachable before re-enabling
+        if source_url:
+            try:
+                r = requests.head(source_url, timeout=10,
+                                  headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code >= 500:
+                    logger.info(f"[{novel_slug}] Source site returned {r.status_code} — deferring auto-resume")
+                    continue
+            except Exception as e:
+                logger.info(f"[{novel_slug}] Source site unreachable ({e}) — deferring auto-resume")
+                continue
+
+        # Re-enable the watch
+        logger.info(f"[{novel_slug}] Auto-resuming after {(now - paused_at)/3600:.1f}h pause (attempt {resume_count + 1}/{max_attempts})")
+        success = health.patch_watch(novel_id, {"active": True})
+        if success:
+            # Reset timeout counter so it gets 3 fresh chances
+            state.reset_timeout(novel_id)
+            state.update_paused_watch_attempts(novel_id, resume_count + 1)
+            state.add_daily_stat("watches_auto_resumed")
+            notifications.notify_watch_resumed(
+                novel_slug,
+                f"Auto-resumed after {(now - paused_at)/3600:.1f}h pause "
+                f"(attempt {resume_count + 1}/{max_attempts}). "
+                f"Will re-pause if timeouts recur."
+            )
+        else:
+            logger.error(f"[{novel_slug}] Failed to re-enable watch via API")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  v5: ADAPTIVE INTERVALS + COMPLETED NOVEL DETECTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _check_adaptive_intervals(cfg):
+    """
+    Runs hourly.  For each active watch:
+
+    1. If the KN novel is marked 'completed', deactivate the watch and notify.
+    2. If no new chapter has appeared in > inactive_days, double the check
+       interval (up to max_interval_hours) to reduce wasted scrape attempts.
+    """
+    adaptive = cfg.get("adaptive_intervals", {})
+    inactive_threshold = adaptive.get("inactive_days", 30) * 86400
+    multiplier         = adaptive.get("interval_multiplier", 2.0)
+    max_hours          = adaptive.get("max_interval_hours", 48)
+    stop_on_completed  = adaptive.get("stop_on_completed", True)
+
+    watches = health.get_watches()
+    if not watches:
+        return
+
+    now = time.time()
+    for w in watches:
+        if not w.get("active"):
+            continue
+
+        novel_id   = w.get("novelId") or w.get("_id") or w.get("id")
+        novel_slug = w.get("novelSlug") or w.get("novelTitle", novel_id)
+        if not novel_id:
+            continue
+
+        # ── 1. Completed novel detection ──────────────────────────────────
+        if stop_on_completed and w.get("novelSlug"):
+            try:
+                novel_info = health.get_kn_novel(w["novelSlug"])
+                if novel_info and str(novel_info.get("status", "")).lower() in ("completed", "complete"):
+                    logger.info(f"[{novel_slug}] KN status is 'completed' — deactivating watch")
+                    health.patch_watch(novel_id, {"active": False})
+                    state.add_daily_stat("watches_stopped_completed")
+                    notifications.notify_watch_completed(novel_slug)
+                    continue
+            except Exception:
+                pass  # API error — skip, try again next hourly cycle
+
+        # ── 2. Slow-down for inactive novels ──────────────────────────────
+        last_new_ch_at = w.get("lastNewChapterAt", w.get("lastChecked", 0))
+        if not last_new_ch_at:
+            continue
+        inactive_secs = now - last_new_ch_at
+        if inactive_secs < inactive_threshold:
+            continue
+
+        current_interval = float(w.get("intervalHours", 1))
+        new_interval     = min(current_interval * multiplier, max_hours)
+        if new_interval <= current_interval + 0.01:
+            continue  # already at max or negligible change
+
+        logger.info(
+            f"[{novel_slug}] No new chapters for {inactive_secs/86400:.0f} days — "
+            f"slowing interval {current_interval}h → {new_interval}h"
+        )
+        health.patch_watch(novel_id, {"intervalHours": new_interval})
+        state.add_daily_stat("intervals_slowed")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  v5: CHAPTER GAP DETECTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _check_chapter_gaps(cfg):
+    """
+    Compare the chapter sequence stored in KN for each watched novel against the
+    expected 1..N sequence.  Report any missing chapters via Discord.
+
+    Automated backfill is NOT attempted — finding the correct source URL for an
+    arbitrary chapter N is unreliable in chain mode.  The Discord alert tells
+    you exactly which chapters are missing so you can fix manually or trigger a
+    targeted one-shot scrape from the dashboard.
+    """
+    gap_cfg       = cfg.get("gap_detection", {})
+    alert_threshold = gap_cfg.get("alert_threshold", 1)
+
+    watches = health.get_watches()
+    if not watches:
+        return
+
+    total_gaps = []
+    for w in watches:
+        if not w.get("active"):
+            continue
+        novel_slug = w.get("novelSlug", "")
+        novel_title = w.get("novelTitle", novel_slug)
+        if not novel_slug:
+            continue
+
+        try:
+            chapters = health.get_kn_chapters(novel_slug)
+            if not chapters:
+                continue
+            stored_nums = sorted({int(c.get("number", 0)) for c in chapters if c.get("number")})
+            if not stored_nums:
+                continue
+            max_ch = stored_nums[-1]
+            stored_set = set(stored_nums)
+            missing = [i for i in range(1, max_ch + 1) if i not in stored_set]
+            if len(missing) >= alert_threshold:
+                total_gaps.append({
+                    "novel_title": novel_title,
+                    "novel_slug":  novel_slug,
+                    "missing":     missing,
+                    "max_ch":      max_ch,
+                })
+        except Exception as e:
+            logger.warn(f"Gap check failed for {novel_slug}: {e}")
+
+    if total_gaps:
+        logger.warn(f"Gap detection found missing chapters in {len(total_gaps)} novel(s)")
+        notifications.notify_chapter_gaps(total_gaps)
+        state.add_daily_stat("gap_checks_with_gaps")
+    else:
+        logger.debug("Gap detection: no missing chapters found")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     main()
+
