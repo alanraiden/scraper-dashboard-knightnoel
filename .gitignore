@@ -54,3 +54,9 @@ Thumbs.db
 
 # Turbopack
 .turbo
+
+# Python cache & tests
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

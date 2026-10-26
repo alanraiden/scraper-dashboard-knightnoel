@@ -3,7 +3,7 @@
 // browser-side scraper if the server is not available.
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { checkForNewChapters }          from '../lib/scraper.js'
+import { checkForNewChapters } from '../lib/scraper.js'
 import { createChapter, getNovelChapters, getNovels, getCredentials } from '../lib/api.js'
 import {
   checkServerHealth, fetchHealthInfo, startJob, streamJob, detectLatestChapter,
@@ -12,7 +12,7 @@ import {
   patchServerConfig, listJobs, pauseJob, resumeJob, pollJob,
 } from '../lib/localScraper.js'
 import { saveJobToHistory } from '../components/JobHistory.jsx'
-import { loadWatermarks }   from '../components/WatermarkEditor.jsx'
+import { loadWatermarks } from '../components/WatermarkEditor.jsx'
 
 // kn_watched_novels: specific to this KN dashboard (avoids clash with the
 // old NovaSphere scraper which used 'ns_watched_novels' on the same port).
@@ -22,29 +22,29 @@ function loadWatched() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]') } catch { return [] }
 }
 function saveWatched(list) { localStorage.setItem(STORAGE_KEY, JSON.stringify(list)) }
-function hasContent(ch)    { return (ch.content || '').trim().length >= 50 }
+function hasContent(ch) { return (ch.content || '').trim().length >= 50 }
 
 // Build the payload the Python server needs to run a watch autonomously
 function watchToServer(w) {
   return {
-    novelId:       w.novelId,
-    novelSlug:     w.novelSlug     || '',
-    novelTitle:    w.novelTitle    || '',
-    startUrl:      w.startUrl      || '',
+    novelId: w.novelId,
+    novelSlug: w.novelSlug || '',
+    novelTitle: w.novelTitle || '',
+    startUrl: w.startUrl || '',
     chapterOneUrl: w.chapterOneUrl || w.startUrl || '',
-    mode:          w.mode          || 'chain',
+    mode: w.mode || 'chain',
     intervalHours: w.intervalHours || 6,
     checkSelector: w.checkSelector || '',
-    lastChapter:   w.lastChapter   || 0,
-    lastChecked:   w.lastChecked   || 0,
-    lastChapterUrl:w.lastChapterUrl|| '',
-    active:        !!w.enabled,
-    delay:         w.delay         || 1.2,
+    lastChapter: w.lastChapter || 0,
+    lastChecked: w.lastChecked || 0,
+    lastChapterUrl: w.lastChapterUrl || '',
+    active: !!w.enabled,
+    delay: w.delay || 1.2,
   }
 }
 
 const CONCURRENCY_KEY = 'kn_watch_concurrency'
-const STAGGER_KEY     = 'kn_stagger_delay'
+const STAGGER_KEY = 'kn_stagger_delay'
 
 function loadConcurrency() {
   const v = parseInt(localStorage.getItem(CONCURRENCY_KEY) || '1', 10)
@@ -56,25 +56,25 @@ function loadStaggerDelay() {
 }
 
 export function useWatcher(addLog) {
-  const [watched,          setWatched]          = useState(loadWatched)
-  const [running,          setRunning]          = useState({})
-  const [serverOnline,     setServerOnline]     = useState(false)
-  const [concurrencyLimit, _setConcurrencyLimit]= useState(loadConcurrency)
-  const [staggerDelay,     _setStaggerDelay]    = useState(loadStaggerDelay)
-  const [queueLength,      setQueueLength]      = useState(0)
+  const [watched, setWatched] = useState(loadWatched)
+  const [running, setRunning] = useState({})
+  const [serverOnline, setServerOnline] = useState(false)
+  const [concurrencyLimit, _setConcurrencyLimit] = useState(loadConcurrency)
+  const [staggerDelay, _setStaggerDelay] = useState(loadStaggerDelay)
+  const [queueLength, setQueueLength] = useState(0)
   // jobQueueState: { [novelId]: position (1-based) } for queued novels
-  const [jobQueueState,    setJobQueueState]    = useState({})
+  const [jobQueueState, setJobQueueState] = useState({})
   // jobRunData: { [novelId]: { jobId, startedAt } } for actively running server jobs
-  const [jobRunData,       setJobRunData]       = useState({})
+  const [jobRunData, setJobRunData] = useState({})
   // ── Batch scrape progress ─────────────────────────────────────────────────
-  const [batchProgress,    setBatchProgress]    = useState(null) // null | { total, done, active }
+  const [batchProgress, setBatchProgress] = useState(null) // null | { total, done, active }
   const batchCancelRef = useRef(false)
-  const timersRef      = useRef({})
-  const healthRef      = useRef(null)
+  const timersRef = useRef({})
+  const healthRef = useRef(null)
   // ── Semaphore state (mutable refs — never trigger re-renders) ─────────────
-  const activeRef      = useRef(0)   // how many slots are currently occupied
-  const waitQueueRef   = useRef([])  // [{ novelId, resolve }] waiting for a slot
-  const concLimitRef   = useRef(loadConcurrency())
+  const activeRef = useRef(0)   // how many slots are currently occupied
+  const waitQueueRef = useRef([])  // [{ novelId, resolve }] waiting for a slot
+  const concLimitRef = useRef(loadConcurrency())
 
   const setConcurrencyLimit = useCallback((val) => {
     const n = Math.max(1, Math.min(10, Number(val) || 1))
@@ -82,7 +82,7 @@ export function useWatcher(addLog) {
     _setConcurrencyLimit(n)
     localStorage.setItem(CONCURRENCY_KEY, String(n))
     // Push to Python server
-    patchServerConfig({ concurrency: n }).catch(() => {})
+    patchServerConfig({ concurrency: n }).catch(() => { })
     // Drain the queue if the new limit allows more slots
     _drainQueue()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -92,7 +92,7 @@ export function useWatcher(addLog) {
     _setStaggerDelay(s)
     localStorage.setItem(STAGGER_KEY, String(s))
     // Push to Python server
-    patchServerConfig({ stagger_delay: s }).catch(() => {})
+    patchServerConfig({ stagger_delay: s }).catch(() => { })
   }, [])
 
   function _drainQueue() {
@@ -121,17 +121,47 @@ export function useWatcher(addLog) {
       const info = await fetchHealthInfo()
       const online = !!info
       setServerOnline(prev => {
-        // On first connect: push all local watches to the server
         if (!prev && online) {
-          const local = loadWatched()
+          // On first connect:
+          //   1. Pull the server’s runtime state (lastChapter, lastChapterUrl, lastChecked)
+          //      so bot-corrected values are not lost on page reload.
+          //   2. Push all local config fields to the server for any watches the server
+          //      doesn’t know about yet.
           const { apiUrl, scraperKey } = getCredentials()
-          local.forEach(w => {
-            upsertServerWatch({
-              ...watchToServer(w),
-              apiUrl,
-              token: scraperKey,
-            }).catch(() => {})
-          })
+            ; (async () => {
+              let serverMap = {}
+              try {
+                const { watches: serverWatches } = await getServerWatches()
+                serverMap = Object.fromEntries(
+                  (serverWatches || []).map(w => [w.novelId, w])
+                )
+              } catch (e) {
+                // Server returned an error — proceed with push-only sync
+                addLog('system', `Could not read server watches on connect: ${e.message}`, 'warn')
+              }
+
+              setWatched(prev => {
+                const merged = prev.map(w => {
+                  const sv = serverMap[w.novelId]
+                  if (!sv) return w
+                  // Merge runtime fields from server (authoritative at rest)
+                  // Never overwrite with 0 or empty if local has a real value.
+                  return {
+                    ...w,
+                    lastChapter: sv.lastChapter > (w.lastChapter || 0) ? sv.lastChapter : w.lastChapter,
+                    lastChecked: sv.lastChecked > (w.lastChecked || 0) ? sv.lastChecked : w.lastChecked,
+                    lastChapterUrl: sv.lastChapterUrl || w.lastChapterUrl,
+                  }
+                })
+                // Push config fields for all local watches to ensure server is in sync
+                merged.forEach(w => {
+                  upsertServerWatch({ ...watchToServer(w), apiUrl, token: scraperKey }).catch(e => {
+                    addLog(w.novelId, `Server sync failed: ${e.message}`, 'warn')
+                  })
+                })
+                return merged
+              })
+            })()
         }
         return online
       })
@@ -139,7 +169,7 @@ export function useWatcher(addLog) {
     check()
     healthRef.current = setInterval(check, 10000)
     return () => clearInterval(healthRef.current)
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const addWatch = useCallback((entry) => {
     const { apiUrl, scraperKey } = getCredentials()
@@ -147,21 +177,21 @@ export function useWatcher(addLog) {
       const existing = prev.find(w => w.novelId === entry.novelId)
       const merged = existing
         ? prev.map(w =>
-            w.novelId === entry.novelId
-              ? { ...w, ...entry, lastChapter: w.lastChapter, lastChecked: w.lastChecked }
-              : w
-          )
+          w.novelId === entry.novelId
+            ? { ...w, ...entry, lastChapter: w.lastChapter, lastChecked: w.lastChecked }
+            : w
+        )
         : [...prev, {
-            ...entry,
-            lastChapter:   0,
-            lastChecked:   null,
-            enabled:       false,
-            chapterOneUrl: entry.chapterOneUrl || entry.startUrl,
-          }]
+          ...entry,
+          lastChapter: 0,
+          lastChecked: null,
+          enabled: false,
+          chapterOneUrl: entry.chapterOneUrl || entry.startUrl,
+        }]
       // Mirror to Python server (fire and forget)
       const saved = merged.find(w => w.novelId === entry.novelId)
       if (saved) {
-        upsertServerWatch({ ...watchToServer(saved), apiUrl, token: scraperKey }).catch(() => {})
+        upsertServerWatch({ ...watchToServer(saved), apiUrl, token: scraperKey }).catch(() => { })
       }
       return merged
     })
@@ -170,7 +200,7 @@ export function useWatcher(addLog) {
   const removeWatch = useCallback((novelId) => {
     stopWatch(novelId)
     setWatched(prev => prev.filter(w => w.novelId !== novelId))
-    deleteServerWatch(novelId).catch(() => {})
+    deleteServerWatch(novelId).catch(() => { })
   }, [])
 
   const updateWatch = useCallback((novelId, patch) => {
@@ -249,7 +279,7 @@ export function useWatcher(addLog) {
       // ── Path A: Python local server ───────────────────────────────────────
       addLog(novelId, `── Watch check (via local Python server) ──`, 'info')
       const apiUrl = localStorage.getItem('kn_api_url') || localStorage.getItem('ns_api_url') || ''
-      const token  = localStorage.getItem('kn_scraper_key') || localStorage.getItem('ns_token')   || ''
+      const token = localStorage.getItem('kn_scraper_key') || localStorage.getItem('ns_token') || ''
 
       // In chain mode with a gap (deleted chapters), rewind to chapterOneUrl so
       // the crawler walks forward from Ch.1 and fills the missing chapters.
@@ -260,19 +290,19 @@ export function useWatcher(addLog) {
       let jobId
       try {
         jobId = await startJob({
-          mode:             'watch_check',
-          start_url:        entry.mode === 'chain' && !gapDetected ? crawlStartUrl : entry.startUrl,
-          chapter_one_url:  crawlStartUrl,
-          novel_id:         novelId,
-          novel_slug:       novelSlug,
-          api_url:          apiUrl,
-          token:            token,
-          from_chapter:     storedLast,
-          index_offset:     entry.mode === 'chain' ? storedLast : 0,
-          delay:            entry.delay || 1.2,
-          max_chapters:     500,
-          watch_mode:       entry.mode || 'index',
-          check_selector:   entry.checkSelector || '',
+          mode: 'watch_check',
+          start_url: entry.mode === 'chain' && !gapDetected ? crawlStartUrl : entry.startUrl,
+          chapter_one_url: crawlStartUrl,
+          novel_id: novelId,
+          novel_slug: novelSlug,
+          api_url: apiUrl,
+          token: token,
+          from_chapter: storedLast,
+          index_offset: entry.mode === 'chain' ? storedLast : 0,
+          delay: entry.delay || 1.2,
+          max_chapters: 500,
+          watch_mode: entry.mode || 'index',
+          check_selector: entry.checkSelector || '',
           custom_watermarks: loadWatermarks(),
         })
       } catch (e) {
@@ -288,8 +318,8 @@ export function useWatcher(addLog) {
       await new Promise((resolve) => {
         let highestUploaded = storedLast
         let lastUploadedUrl = null
-        const jobStartedAt  = Date.now()
-        const jobLogs       = []
+        const jobStartedAt = Date.now()
+        const jobLogs = []
         const cleanup = streamJob(jobId, {
           onLog: (entry) => {
             if (entry.msg.startsWith('__last_chapter_url__:')) {
@@ -304,18 +334,18 @@ export function useWatcher(addLog) {
               if (n > highestUploaded) highestUploaded = n
             }
           },
-          onStats: () => {},
+          onStats: () => { },
           onDone: (stats) => {
             saveJobToHistory({
-              id:         jobId,
+              id: jobId,
               novelId,
               novelTitle: entry.novelTitle || novelId,
-              mode:       'watch_check',
-              startedAt:  jobStartedAt,
+              mode: 'watch_check',
+              startedAt: jobStartedAt,
               finishedAt: Date.now(),
-              status:     stats.uploaded > 0 ? 'done_ok' : stats.errors > 0 ? 'error' : 'done_warn',
+              status: stats.uploaded > 0 ? 'done_ok' : stats.errors > 0 ? 'error' : 'done_warn',
               stats,
-              logs:       jobLogs,
+              logs: jobLogs,
             })
             if (highestUploaded > storedLast) {
               setWatched(prev => prev.map(w => {
@@ -343,9 +373,9 @@ export function useWatcher(addLog) {
       addLog(novelId, `── Watch check (browser scraper — local server not running) ──`, 'warn')
       addLog(novelId, `Tip: run "python scraper-server/scraper_server.py" for better results`, 'dim')
 
-      const browserJobId  = `browser-${Date.now()}`
-      const browserStart  = Date.now()
-      const browserLogs   = []
+      const browserJobId = `browser-${Date.now()}`
+      const browserStart = Date.now()
+      const browserLogs = []
       const logAndCollect = (msg, type) => {
         addLog(novelId, msg, type)
         browserLogs.push({ msg, type, ts: Date.now() })
@@ -369,7 +399,7 @@ export function useWatcher(addLog) {
       }
 
       const uploadable = newChapters.filter(ch => hasContent(ch))
-      const skipped    = newChapters.filter(ch => !hasContent(ch))
+      const skipped = newChapters.filter(ch => !hasContent(ch))
       if (skipped.length)
         addLog(novelId, `⚠ ${skipped.length} chapter(s) skipped — no text content`, 'warn')
 
@@ -403,15 +433,15 @@ export function useWatcher(addLog) {
         return { ...w, ...patch }
       }))
       saveJobToHistory({
-        id:         browserJobId,
+        id: browserJobId,
         novelId,
         novelTitle: entry.novelTitle || novelId,
-        mode:       'watch_check',
-        startedAt:  browserStart,
+        mode: 'watch_check',
+        startedAt: browserStart,
         finishedAt: Date.now(),
-        status:     pushed > 0 ? 'done_ok' : 'done_warn',
-        stats:      { scraped: newChapters.length, uploaded: pushed, skipped: skipped.length, errors: 0 },
-        logs:       browserLogs,
+        status: pushed > 0 ? 'done_ok' : 'done_warn',
+        stats: { scraped: newChapters.length, uploaded: pushed, skipped: skipped.length, errors: 0 },
+        logs: browserLogs,
       })
       logAndCollect(
         pushed > 0 ? `── Done: ${pushed} chapter(s) uploaded ──` : `── Done: 0 uploaded ──`,
@@ -477,7 +507,7 @@ export function useWatcher(addLog) {
 
     // All slots are busy — find the oldest running job on the server to pause
     let victimNovelId = null
-    let victimJobId   = null
+    let victimJobId = null
     try {
       const { jobs: serverJobs } = await listJobs()
       // Find the oldest running job that is NOT this novel
@@ -491,9 +521,9 @@ export function useWatcher(addLog) {
         if (!matchedNovelId || matchedNovelId === novelId) continue
         const startedAt = jinfo.started_at || 0
         if (startedAt < oldestStarted) {
-          oldestStarted  = startedAt
-          victimJobId    = jid
-          victimNovelId  = matchedNovelId
+          oldestStarted = startedAt
+          victimJobId = jid
+          victimNovelId = matchedNovelId
         }
       }
     } catch (e) {
@@ -612,7 +642,7 @@ export function useWatcher(addLog) {
     timersRef.current[novelId] = id
     updateWatch(novelId, { enabled: true })
     // Mirror to server — server scheduler will also fire independently
-    startServerWatch(novelId).catch(() => {})
+    startServerWatch(novelId).catch(() => { })
     addLog(novelId, `Auto-watcher started (every ${intervalHours}h) — server scheduler active`, 'info')
   }, [runCheck, updateWatch, addLog])
 
@@ -620,7 +650,7 @@ export function useWatcher(addLog) {
     const id = timersRef.current[novelId]
     if (id) { clearInterval(id); delete timersRef.current[novelId] }
     updateWatch(novelId, { enabled: false })
-    stopServerWatch(novelId).catch(() => {})
+    stopServerWatch(novelId).catch(() => { })
     addLog(novelId, `Auto-watcher stopped`, 'warn')
   }, [updateWatch, addLog])
 
@@ -645,9 +675,20 @@ export function useWatcher(addLog) {
     return () => Object.values(timersRef.current).forEach(clearInterval)
   }, [])
 
-  const updateChainUrl = useCallback((novelId, url) => {
+  const updateChainUrl = useCallback(async (novelId, url) => {
+    // 1. Update local React state + localStorage immediately for snappy UI
     updateWatch(novelId, { lastChapterUrl: url })
     addLog(novelId, `Chain URL manually updated to: ${url}`, 'info')
+
+    // 2. Persist to the Python server so the scheduler uses the corrected URL.
+    //    Uses force_lastChapterUrl=true so the server’s existing stale value
+    //    cannot silently win over the intentional correction.
+    try {
+      await patchServerWatch(novelId, { lastChapterUrl: url })
+      addLog(novelId, `✓ Chain URL saved to server`, 'dim')
+    } catch (e) {
+      addLog(novelId, `⚠ Chain URL saved locally but server sync failed: ${e.message}`, 'warn')
+    }
   }, [updateWatch, addLog])
 
   const isWatching = (novelId) => !!timersRef.current[novelId]

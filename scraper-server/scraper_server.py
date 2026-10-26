@@ -141,6 +141,131 @@ def _save_watches(watches):
         json.dump(watches, f, indent=2, ensure_ascii=False)
     os.replace(tmp, _WATCHES_FILE)
 
+
+# =============================================================================
+#  CHAIN-URL VALIDATION
+# =============================================================================
+
+# These path fragments indicate a non-chapter page that must never be saved
+# as a chain checkpoint even if the scraper emitted it as __last_chapter_url__.
+_JUNK_PATH_FRAGMENTS = (
+    "/sign-up", "/signup", "/register", "/login", "/cart",
+    "/checkout", "/account", "/profile", "/members",
+    "/search", "/tag", "/category", "/genre",
+)
+
+
+def validate_chain_url(url, watch, invalid_url=False):
+    """
+    Return True iff *url* is an acceptable chain checkpoint for *watch*.
+
+    Checks:
+      1. URL must be non-empty and parseable.
+      2. Domain must match the watch's startUrl domain.
+      3. URL must NOT be the same as startUrl (index page).
+      4. URL path must NOT be a known non-chapter path.
+      5. URL must contain the novel slug somewhere in the path.
+      6. URL must NOT contain a fragment-only anchor on the same page as startUrl.
+    """
+    if invalid_url:
+        return False
+    if not url:
+        return False
+
+    try:
+        parsed      = urlparse(url)
+        start_parsed = urlparse(watch.get("startUrl", ""))
+    except Exception:
+        return False
+
+    # 1. Must have a scheme and netloc
+    if not parsed.scheme or not parsed.netloc:
+        return False
+
+    # 2. Domain must match
+    if parsed.netloc.lower() != start_parsed.netloc.lower():
+        return False
+
+    path = parsed.path.rstrip("/").lower()
+
+    # 3. Must not be the index/start page itself
+    start_path = start_parsed.path.rstrip("/").lower()
+    if path == start_path:
+        return False
+
+    # 4. Must not be a known non-chapter path
+    for frag in _JUNK_PATH_FRAGMENTS:
+        if frag in path:
+            return False
+
+    # 5. Must contain the novel slug somewhere in the path
+    slug = (watch.get("novelSlug") or "").lower().strip("/")
+    if slug and slug not in path:
+        return False
+
+    # 6. Fragment-only anchor on the index page (e.g. startUrl/#comments)
+    if parsed.fragment and path == start_path:
+        return False
+
+    return True
+
+
+# =============================================================================
+#  POST-RUN WATCH UPDATE  (extracted so tests can call it directly)
+# =============================================================================
+
+def _apply_post_run_watch_update(novel_id, job_logs, job_stats, watch_mode):
+    """
+    Write lastChecked, lastChapter, and lastChapterUrl back to watches.json
+    after a job finishes.  Called by run_scrape_job (for scheduler-triggered
+    jobs) and exposed as a standalone function so regression tests can call it
+    without running a real scrape job.
+
+    Rules:
+      - lastChecked is always updated.
+      - lastChapter is ONLY advanced when job_stats["uploaded"] > 0 (confirmed
+        successful upload).  Scraped-but-not-uploaded chapters do NOT count.
+      - lastChapterUrl is only saved if validate_chain_url() passes.
+    """
+    with _watches_lock:
+        watches = _load_watches()
+        if novel_id not in watches:
+            return
+        w = watches[novel_id]
+        w["lastChecked"] = time.time()
+
+        # ── lastChapter: only advance if uploads were confirmed ───────────────
+        uploaded = job_stats.get("uploaded", 0)
+        if uploaded > 0:
+            # Derive the highest chapter number from "ok" log lines
+            highest_ch = 0
+            for entry in reversed(job_logs):
+                msg = entry.get("msg", "")
+                if entry.get("type") == "ok" and msg.startswith("Ch."):
+                    m = re.match(r"Ch\.(\d+)", msg)
+                    if m:
+                        highest_ch = max(highest_ch, int(m.group(1)))
+                        break  # reversed → first match is the highest
+            if highest_ch > w.get("lastChapter", 0):
+                w["lastChapter"] = highest_ch
+
+        # ── lastChapterUrl: validate before saving ────────────────────────────
+        if watch_mode == "chain" or w.get("mode") == "chain":
+            for entry in reversed(job_logs):
+                msg = entry.get("msg", "")
+                if "__last_chapter_url__:" in msg:
+                    candidate = msg.split("__last_chapter_url__:")[1].strip()
+                    if validate_chain_url(url=candidate, watch=w):
+                        w["lastChapterUrl"] = candidate
+                    else:
+                        print(
+                            f"[WatchUpdate] Rejected chain URL for {novel_id}: "
+                            f"{candidate!r} failed validation"
+                        )
+                    break
+
+        _save_watches(watches)
+
 # -- Scraper config -----------------------------------------------------------
 DEFAULT_DELAY      = 1.2
 MAX_CONSECUTIVE_SKIPS = 5   # stop crawl after this many locked/empty chapters in a row
@@ -698,6 +823,21 @@ def run_scrape_job(job_id, params):
             # honour that lower start so those chapters get re-scraped.
             api_max = _fetch_max_stored_chapter(api_url, novel_slug, token)
             if api_max > from_chapter:
+                # Bug C4 fix: cap how far ahead api_max can push from_chapter.
+                # If the KN chapterCount field was set too high (stale/corrupt) and
+                # empty chapter records exist for those phantom numbers, api_max could
+                # skip an entire unpublished range.  We only trust api_max if it
+                # doesn't jump more than MAX_API_JUMP chapters ahead of what the
+                # watch already knows about.
+                MAX_API_JUMP = 50
+                if api_max - from_chapter > MAX_API_JUMP:
+                    log(
+                        f"KN API reports Ch.{api_max} but watch only knows Ch.{from_chapter} "
+                        f"— jump of {api_max - from_chapter} exceeds MAX_API_JUMP ({MAX_API_JUMP}). "
+                        f"Capping at Ch.{from_chapter + MAX_API_JUMP} to avoid skipping real chapters.",
+                        "warn",
+                    )
+                    api_max = from_chapter + MAX_API_JUMP
                 log(f"KN API reports {api_max} chapters stored — starting after Ch.{api_max}", "dim")
                 from_chapter = api_max
                 index_offset = api_max   # chain mode: keep index numbering aligned
@@ -717,6 +857,12 @@ def run_scrape_job(job_id, params):
         index   = index_offset + 1  # chain mode: start index at the right offset so infer_chapter_number fallback is correct
         visited = set()
         last_real_chapter_url = None  # tracks highest chapter URL for chain mode
+        # Bug C1 fix: track whether __last_chapter_url__ was already emitted inside
+        # the loop so the post-loop block doesn't emit it a second time.
+        _chain_url_emitted = False
+        # Bug C3 fix: initialise consecutive_skips (was referenced but never declared,
+        # causing a NameError that silently aborted the crawl at the first skipped chapter).
+        consecutive_skips = 0
 
         while url and stats["scraped"] < max_chapters:
             # Check if job was cancelled or paused
@@ -740,6 +886,13 @@ def run_scrape_job(job_id, params):
                         stats["errors"]   += len(errs)
                         upload_batch.clear()
                         push_stats()
+                    # Bug C5 fix: emit __last_chapter_url__ so the watch scheduler
+                    # can update lastChapterUrl for the NEXT fresh job it triggers.
+                    # Without this, the scheduler re-starts from the old checkpoint
+                    # and re-uploads already-stored chapters.
+                    if last_real_chapter_url and not _chain_url_emitted:
+                        log(f"__last_chapter_url__:{last_real_chapter_url}", "dim")
+                        _chain_url_emitted = True
                     update({"stats": dict(stats)})
                     return  # exit run_scrape_job; semaphore released by _dispatch_loop's finally
 
@@ -760,7 +913,6 @@ def run_scrape_job(job_id, params):
 
             if ch_num > from_chapter:
                 stats["scraped"] += 1
-                last_real_chapter_url = url  # update on every new chapter seen
                 wc = len((content or "").split())
 
                 # Check for paywall pages, UI chrome, login walls, and
@@ -769,6 +921,7 @@ def run_scrape_job(job_id, params):
                 if junk:
                     log(f"Ch.{ch_num} -- {title}: locked/unavailable ({reason}) — stopping here", "warn")
                     stats["skipped"] += 1
+                    consecutive_skips += 1
                     push_stats()
                     # Flush whatever was already batched up to this point
                     if upload_batch:
@@ -777,13 +930,19 @@ def run_scrape_job(job_id, params):
                         stats["errors"]   += len(errs)
                         upload_batch.clear()
                         push_stats()
-                    # Emit the last good chapter URL so chain/watch mode resumes correctly
-                    if last_real_chapter_url:
+                    # Emit the PREVIOUS good chapter URL so chain resumes correctly.
+                    # Bug C2 fix: last_real_chapter_url is only set for real content
+                    # pages, so it never points to a junk/paywall page here.
+                    if last_real_chapter_url and not _chain_url_emitted:
                         log(f"__last_chapter_url__:{last_real_chapter_url}", "dim")
+                        _chain_url_emitted = True
                     log("-- Stopped at first locked chapter (content unavailable) --", "warn")
                     break
 
                 else:
+                    # Bug C2 fix: only record URL after confirming real content
+                    last_real_chapter_url = url
+                    consecutive_skips = 0
                     log(f"Ch.{ch_num} -- {title} ({wc}w)", "ok")
                     # Record that progress was made — bot uses this for stuck-job detection
                     update({"last_progress_at": time.time()})
@@ -797,7 +956,7 @@ def run_scrape_job(job_id, params):
                     push_stats()
             else:
                 log(f"~ Ch.{ch_num} already stored, skipping", "dim")
-                consecutive_skips = 0  # already-stored is not a lock skip
+                consecutive_skips = 0  # already-stored chapters don't count as lock skips
 
             next_url = find_next_url(soup, url, html or "", log)
             # Strip fragment-only URLs like chapter-237/#respond — these are comment anchors not chapters
@@ -808,17 +967,22 @@ def run_scrape_job(job_id, params):
                     next_url = None  # same page, just an anchor — treat as end of crawl
             if not next_url or next_url == url:
                 log("No more chapters found.", "info")
-                # Emit the last real chapter URL for chain mode tracking
-                emit_url = last_real_chapter_url or url
-                log(f"__last_chapter_url__:{emit_url}", "dim")
+                # Emit the last real chapter URL for chain mode tracking.
+                # Bug C1 fix: use the flag so the post-loop block below doesn't emit again.
+                if not _chain_url_emitted:
+                    emit_url = last_real_chapter_url or url
+                    log(f"__last_chapter_url__:{emit_url}", "dim")
+                    _chain_url_emitted = True
                 break
             url    = next_url
             index += 1
             time.sleep(delay)
 
-        # Emit last chapter URL if loop ended due to max_chapters (not via the inner break)
-        if last_real_chapter_url:
+        # Emit last chapter URL when loop exited due to max_chapters limit.
+        # Bug C1 fix: only emit if the inner loop didn't already emit it.
+        if last_real_chapter_url and not _chain_url_emitted:
             log(f"__last_chapter_url__:{last_real_chapter_url}", "dim")
+            _chain_url_emitted = True
 
         # Flush any remaining chapters that didn't fill a full batch
         if upload_batch:
@@ -841,43 +1005,21 @@ def run_scrape_job(job_id, params):
 
     # ── Watch post-run update ─────────────────────────────────────────────────
     # If this job was triggered by the WatchScheduler, write back lastChecked,
-    # lastChapter (FIX: was never written — caused Ch.0 to show in dashboard),
-    # and lastChapterUrl so the next scheduled run starts from the right place.
+    # lastChapter, and lastChapterUrl.  Uses _apply_post_run_watch_update() so
+    # the logic is testable independently and consistent with the validation rules:
+    #   - lastChapter only advances when uploaded > 0 (confirmed upload)
+    #   - lastChapterUrl is validated against the novel's domain + slug before saving
     watch_novel_id = params.get("_watch_novel_id")
     if watch_novel_id:
         with jobs_lock:
-            job_logs  = jobs.get(job_id, {}).get("logs", [])
-            job_stats = jobs.get(job_id, {}).get("stats", {})
-        with _watches_lock:
-            watches = _load_watches()
-            if watch_novel_id in watches:
-                w = watches[watch_novel_id]
-                w["lastChecked"] = time.time()
-
-                # ── Fix Ch.0 bug: derive highest chapter number from logs ──────
-                # Logs contain lines like "Ch.42 -- Title (123w)" (type "ok").
-                # We scan them in reverse to find the last successfully uploaded ch.
-                highest_ch = 0
-                for entry in reversed(job_logs):
-                    msg = entry.get("msg", "")
-                    if entry.get("type") == "ok" and msg.startswith("Ch."):
-                        m = re.match(r"Ch\.(\d+)", msg)
-                        if m:
-                            highest_ch = max(highest_ch, int(m.group(1)))
-                            break   # reversed → first match is the highest
-
-                # Only advance lastChapter, never go backwards
-                if highest_ch > w.get("lastChapter", 0):
-                    w["lastChapter"] = highest_ch
-
-                # ── Chain: update lastChapterUrl so next run starts here ───────
-                if w.get("mode") == "chain":
-                    for entry in reversed(job_logs):
-                        if "__last_chapter_url__:" in entry.get("msg", ""):
-                            w["lastChapterUrl"] = entry["msg"].split("__last_chapter_url__:")[1].strip()
-                            break
-
-                _save_watches(watches)
+            job_logs  = list(jobs.get(job_id, {}).get("logs", []))
+            job_stats = dict(jobs.get(job_id, {}).get("stats", {}))
+        _apply_post_run_watch_update(
+            novel_id=watch_novel_id,
+            job_logs=job_logs,
+            job_stats=job_stats,
+            watch_mode=params.get("watch_mode", ""),
+        )
 
 
 # =============================================================================
@@ -1416,31 +1558,18 @@ class WatchScheduler:
             job_queue.append((job_id, params))
 
     def _run_and_update(self, job_id, params, novel_id):
-        """Run the scrape job then write lastChecked/lastChapter back to watches.json."""
-        run_scrape_job(job_id, params)
+        """
+        DEAD CODE — never called.
 
-        # Read back the job stats to find the highest chapter uploaded
-        with jobs_lock:
-            job   = jobs.get(job_id, {})
-            stats = job.get("stats", {})
-            logs  = job.get("logs", [])
-
-        new_last = stats.get("last_chapter", 0)
-
-        with _watches_lock:
-            watches = _load_watches()
-            if novel_id in watches:
-                w = watches[novel_id]
-                w["lastChecked"] = time.time()
-                if new_last and new_last > w.get("lastChapter", 0):
-                    w["lastChapter"] = new_last
-                # Chain: update lastChapterUrl so next run starts where we left off
-                if w.get("mode") == "chain":
-                    for log in reversed(logs):
-                        if "__last_chapter_url__:" in log.get("msg", ""):
-                            w["lastChapterUrl"] = log["msg"].split("__last_chapter_url__:")[1].strip()
-                            break
-                _save_watches(watches)
+        Jobs are now dispatched via _dispatch_loop → run_scrape_job, and the
+        post-run watch update is handled inside run_scrape_job itself via
+        _apply_post_run_watch_update().  This method is preserved for historical
+        context only and will be removed in a future cleanup.
+        """
+        raise RuntimeError(
+            "_run_and_update is dead code and must not be called. "
+            "Post-run watch updates are handled inside run_scrape_job()."
+        )
 
 
 # =============================================================================
@@ -1488,11 +1617,24 @@ def upsert_watch():
     with _watches_lock:
         watches = _load_watches()
         existing = watches.get(novel_id, {})
+
+        # ── lastChapterUrl resolution ────────────────────────────────────────
+        # Normally we prefer the server's existing value (so a corrected URL
+        # is not silently overwritten by a stale push from the browser).
+        # Exception: when the caller sends force_lastChapterUrl=true, they are
+        # explicitly fixing a wrong value — honour their URL.
+        body_url   = body.get("lastChapterUrl", "")
+        force_url  = bool(body.get("force_lastChapterUrl", False))
+        if force_url and body_url:
+            resolved_chain_url = body_url
+        else:
+            resolved_chain_url = existing.get("lastChapterUrl") or body_url
+
         watches[novel_id] = {
-            # Preserve runtime fields if they exist
+            # Runtime fields — preserved from existing unless explicitly forced
             "lastChapter":    existing.get("lastChapter",    body.get("lastChapter",    0)),
             "lastChecked":    existing.get("lastChecked",    body.get("lastChecked",    0)),
-            "lastChapterUrl": existing.get("lastChapterUrl", body.get("lastChapterUrl", "")),
+            "lastChapterUrl": resolved_chain_url,
             # Config from request
             "novelSlug":      body.get("novelSlug", "").strip(),
             "novelTitle":     body.get("novelTitle", "").strip(),
