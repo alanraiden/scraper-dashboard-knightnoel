@@ -69,6 +69,9 @@ def _dispatch_loop():
         with job_queue_lock:
             pending = job_queue[:]
         if not pending:
+            # Periodically clean up old completed jobs when idle
+            if len(jobs) > 50:
+                _cleanup_old_jobs()
             time.sleep(0.2)
             continue
         # Try to acquire a slot (non-blocking peek so we don't hold the lock)
@@ -998,6 +1001,31 @@ def cancel_job(job_id):
         global job_queue
         job_queue = [(jid, p) for jid, p in job_queue if jid != job_id]
     return jsonify({"ok": True})
+
+
+def _cleanup_old_jobs():
+    """Remove completed/cancelled/failed jobs older than 1 hour to prevent memory buildup."""
+    cutoff = time.time() - 3600  # 1 hour
+    terminal_states = ("done", "cancelled", "failed", "error")
+    with jobs_lock:
+        to_remove = [
+            jid for jid, j in jobs.items()
+            if j.get("status") in terminal_states
+            and j.get("started_at", 0) < cutoff
+        ]
+        for jid in to_remove:
+            del jobs[jid]
+    if to_remove:
+        print(f"[Cleanup] Removed {len(to_remove)} old completed jobs")
+
+
+@app.route("/jobs/cleanup", methods=["POST"])
+def cleanup_jobs():
+    """Manually trigger cleanup of old completed jobs."""
+    _cleanup_old_jobs()
+    with jobs_lock:
+        remaining = len(jobs)
+    return jsonify({"ok": True, "remaining_jobs": remaining})
 
 
 @app.route("/jobs/<job_id>/pause", methods=["POST"])

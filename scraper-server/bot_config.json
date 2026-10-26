@@ -1,6 +1,6 @@
 {
   "scraper_url": "http://localhost:7832",
-  "kn_api_url": "http://localhost:3000",
+  "kn_api_url": "https://knightnovel.online",
   "kn_api_key": "skpr_7f4a2b9e1c6d3f8a5b0e7d4c2a9f6e3b1d8c5a2",
 
   "healthcheck_url": "",
